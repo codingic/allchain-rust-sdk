@@ -1,0 +1,23 @@
+[package]
+name = "btc-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "btc_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+allchain-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+bitcoin = "0.32"
+bitcoincore-rpc = "0.19"
+clap = { workspace = true }
+hex = "0.4.3"
+rand = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,26 @@
+# Rust 构建产物（workspace 根 target 与任何子级 target）
+/target/
+**/target/
+*.rs.bk
+
+# 依赖与调试符号
+Cargo.lock.bak
+
+# macOS Finder
+.DS_Store
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 本地环境变量与密钥
+.env
+.env.*
+*.pem
+*.key
+
+# 本地 agent 工作目录（过程笔记，不入库）
+.workbuddy/

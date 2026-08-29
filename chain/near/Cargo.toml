@@ -1,0 +1,24 @@
+[package]
+name = "near-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "near_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+allchain-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+bs58 = "0.5"
+clap = { workspace = true }
+hex = "0.4.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+near-crypto = { version = "0.37", features = ["rand"] }
+near-jsonrpc-client = "0.22"
+near-jsonrpc-primitives = "0.37"
+near-primitives = "0.37"

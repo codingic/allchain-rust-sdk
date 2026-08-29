@@ -1,0 +1,31 @@
+[package]
+name = "sol-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sol_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+allchain-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+solana-commitment-config = "3.1.1"
+solana-hash = "4.5.0"
+solana-instruction = "3.4.1"
+solana-keypair = "3.1.2"
+solana-message = "4.4.1"
+solana-pubkey = "4.2.1"
+solana-rpc-client = "4.2.1"
+solana-rpc-client-types = "4.2.1"
+solana-signature = "3.4.1"
+solana-signer = "3.0.1"
+solana-system-interface = "3.2.0"
+solana-transaction = "4.1.6"
+solana-transaction-status-client-types = "4.2.1"

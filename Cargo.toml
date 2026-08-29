@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "core",
+    "acli",
+    "chain/rpcutil",
+    "chain/eth",
+    "chain/btc",
+    "chain/sol",
+    "chain/near",
+    "chain/apt",
+    "chain/ar",
+    "chain/ckb",
+    "chain/fil",
+    "chain/sui",
+    "chain/ton",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[workspace.dependencies]
+allchain-core = { path = "core" }
+chain-rpcutil = { path = "chain/rpcutil" }
+anyhow = "1.0.104"
+async-trait = "0.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+hex = "0.4.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+# 新链地址派生用到的轻量哈希/编码原语。
+sha2 = "0.10"
+sha3 = "0.10"
+blake2 = "0.10"
+base64 = "0.22"

@@ -1,0 +1,19 @@
+[package]
+name = "ton-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "TON adapter for the allchain unified ChainClient contract (toncenter REST)"
+
+[lib]
+name = "ton_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+allchain-core = { workspace = true }
+chain-rpcutil = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

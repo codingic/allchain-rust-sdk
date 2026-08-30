@@ -17,7 +17,7 @@ sol-sdk = { path = "../chain/sol" }
 near-sdk = { path = "../chain/near" }
 apt-sdk = { path = "../chain/apt" }
 ar-sdk = { path = "../chain/ar" }
-ckb-sdk = { path = "../chain/ckb" }
+allchain-ckb = { path = "../chain/ckb" }
 fil-sdk = { path = "../chain/fil" }
 sui-sdk = { path = "../chain/sui" }
 ton-sdk = { path = "../chain/ton" }

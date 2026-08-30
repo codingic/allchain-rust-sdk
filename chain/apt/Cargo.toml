@@ -18,3 +18,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 sha3 = { workspace = true }
+aptos-sdk = "0.4.1"

@@ -32,7 +32,8 @@ acli chains
 acli status  --chain btc
 acli balance --chain eth --address 0x00000000219ab540356cbb839cbe05303d7705fa
 acli getbalance --chain eth --address 0x...                  # balance 的别名
-acli block   --chain sol --reference 340000000
+acli block-height   --chain eth
+acli block-by-height --chain eth --height 19000000
 acli tx      --chain near --hash <tx_hash>@<sender.near>
 acli address-from-pubkey --chain eth --pubkey 0x04...        # 公钥 -> 地址（本地计算）
 acli transfer --chain eth --to 0x... --amount 0.01 --dry-run  # 转账（--dry-run 只本地签名，不广播）
@@ -74,7 +75,8 @@ curl 'http://127.0.0.1:8787/v1/chains'
 curl 'http://127.0.0.1:8787/v1/status?chain=btc'
 curl 'http://127.0.0.1:8787/v1/balance?chain=eth&address=0x...'
 curl 'http://127.0.0.1:8787/v1/getbalance?chain=eth&address=0x...'   # balance 的别名
-curl 'http://127.0.0.1:8787/v1/block?chain=sol&reference=340000000'
+curl 'http://127.0.0.1:8787/v1/block/height?chain=eth'               # 链头高度
+curl 'http://127.0.0.1:8787/v1/block/by-height?chain=eth&height=19000000'  # 按高度查块
 curl 'http://127.0.0.1:8787/v1/tx?chain=near&hash=<tx_hash>@<sender.near>'
 curl 'http://127.0.0.1:8787/v1/address-from-pubkey?chain=btc&pubkey=02...'
 # 转账（POST，敏感字段放 body）：
@@ -105,7 +107,7 @@ acli mcp
 }
 ```
 
-暴露 8 个工具，agent 通过 `tools/list` 自动发现、无需读文档：
+暴露 9 个工具，agent 通过 `tools/list` 自动发现、无需读文档：
 
 | 工具 | 必填参数 | 说明 |
 |---|---|---|
@@ -113,7 +115,8 @@ acli mcp
 | `chain_status` | `chain` | 节点与链状态 |
 | `chain_balance` | `chain`, `address` | 余额 |
 | `chain_get_balance` | `chain`, `address` | 余额（`chain_balance` 的别名） |
-| `chain_block` | `chain`，`reference`（SOL 必填为 slot；SUI 为 checkpoint 序号；TON 为主链 seqno） | 区块 |
+| `chain_block_height` | `chain` | 链头高度（最新区块高度，裸数字） |
+| `chain_block_by_height` | `chain`, `height` | 按高度查块（含父哈希、时间戳、交易数、gas）；SOL 传 slot，SUI 传 checkpoint 序号，TON 传 masterchain seqno |
 | `chain_tx` | `chain`, `hash` | 交易（NEAR 需 `<hash>@<account>`，TON 需 `<hash>:<lt>@<address>`） |
 | `chain_address_from_pubkey` | `chain`, `pubkey` | 公钥 → 地址（本地计算；TON 不支持） |
 | `chain_transfer` | `chain`, `to`, `amount` | 原生资产转账（**仅 eth/btc/sol/near**；可选 `private_key` / `dry_run` / `from`） |
@@ -257,7 +260,7 @@ acli address-from-pubkey --chain sui  --pubkey [ed25519:|secp256k1:]<hex>
 必须知道的坑：
 
 1. **十链默认就是主网**。只读查询无风险；`transfer` 直接动主网资金（仅前四链支持），务必先 `--dry-run` 确认收款方与 `--network`，切测试网要显式指定。
-2. **SOL 按 slot 查区块**，不是区块高度，且 `block` 必须显式传 `--reference`；公共节点只保留最近约 1–2 天的区块，mainnet 公共端点对 `getBlock` 限流较严，生产建议换私有 RPC。
+2. **SOL 按 slot 查区块**，不是区块高度，用 `block-by-height --height <slot>` 传 slot；公共节点只保留最近约 1–2 天的区块，mainnet 公共端点对 `getBlock` 限流较严，生产建议换私有 RPC。
 3. **NEAR 查交易必须带发送者**：`--hash <tx_hash>@<sender.near>`。历史交易还要改用归档端点 `--rpc-url https://archival-rpc.mainnet.near.org`。
 4. **BTC 的 `--rpc-url` 是 Esplora 索引器地址**，不是 bitcoind 的 JSON-RPC 端点；余额、UTXO 类查询必须有索引器。
 5. **SUI 只走 GraphQL**：官方公共 fullnode 的 JSON-RPC 已废弃，主网端点是 `https://graphql.mainnet.sui.io/graphql`；区块叫 checkpoint（传序号），交易数取相邻 checkpoint 的 `networkTotalTransactions` 差值。

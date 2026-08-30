@@ -6,7 +6,7 @@
 - 返回**结构完全一致**的 JSON 信封，错误码跨链统一，agent 无需按链分支解析；
 - 前四链基于官方 Rust SDK（alloy、rust-bitcoin、solana-rpc-client、near-jsonrpc-client）；后六链为避免拖入庞大依赖树，统一走共享轻量 HTTP 库 `chain-rpcutil`（REST / JSON-RPC / GraphQL）直连公共端点。
 
-> **能力边界**：十链全部支持只读四件套 `status` / `balance` / `block` / `tx` 与本地 `address_from_pubkey`（TON 除外，其地址由钱包合约 StateInit 决定、不能仅由公钥派生）；`transfer` 本地签名目前仅 ETH / BTC / SOL / NEAR 实现，其余六链返回 `UNSUPPORTED`。`acli chains` 可查看每链实时能力清单。
+> **能力边界**：十链全部支持只读四件套 `status` / `balance` / `block-height` + `block-by-height` / `tx` 与本地 `address_from_pubkey`（TON 除外，其地址由钱包合约 StateInit 决定、不能仅由公钥派生）；`transfer` 本地签名目前仅 ETH / BTC / SOL / NEAR 实现，其余六链返回 `UNSUPPORTED`。`acli chains` 可查看每链实时能力清单。
 
 ---
 
@@ -177,7 +177,7 @@ acli mcp
 |---|---|
 | `status` | `latest_height`、`latest_hash`、`node_version` |
 | `balance` | `address`、`balance_raw`（最小单位整数字符串）、`balance_ui`（可读）、`symbol`、`decimals` |
-| `block` | `height`、`hash`、`parent_hash`、`timestamp`、`tx_count` |
+| `block_by_height` | `height`、`hash`、`parent_hash`、`timestamp`、`tx_count` |
 | `tx` | `hash`、`status`、`from`、`to`、`amount_raw`、`amount_ui`、`fee_raw`、`height`、`timestamp`、`confirmations` |
 | `address_from_pubkey` | `pubkey`、`address`、`address_type`、`pubkey_bytes` |
 
@@ -291,7 +291,7 @@ allchain-rust-sdk/
 ### 新增一条链
 
 1. 在 `core/src/chain.rs` 的 `ChainKind` 加变体，补齐 `parse` 别名 / `symbol` / `unit_name` / `decimals` / `default_network`，并在 `capabilities()` 如实声明能力；
-2. 建 `chain/<new>/src/{lib,network,adapter}.rs`（优先用 `chain-rpcutil` 直连，避免拖入官方 SDK 依赖树），实现 `ChainClient`（`status` / `balance` / `block` / `tx` 必做；可选 `address_from_pubkey`——trait 有默认实现，不实现会返回 `UNSUPPORTED`；`transfer` 同理）；
+2. 建 `chain/<new>/src/{lib,network,adapter}.rs`（优先用 `chain-rpcutil` 直连，避免拖入官方 SDK 依赖树），实现 `ChainClient`（`status` / `balance` / `last_block_height` / `block_by_height` / `tx` 必做；`block` 已拆分为两个类型安全方法——`last_block_height` 返回裸 `u64`，`block_by_height` 收 `u64` 高度，按哈希查块已移除；可选 `address_from_pubkey`——trait 有默认实现，不实现会返回 `UNSUPPORTED`；`transfer` 同理）；
 3. 在 `acli/src/dispatch.rs` 的 `build_client` 加分支、`private_key_env` 补穷尽分支；
 4. 把新 crate 加进根 `Cargo.toml` 的 `members` 与 `acli` 的依赖；同步 `main.rs` 帮助文本与 `mcp.rs` 的 chain enum / 工具描述。
 
@@ -305,9 +305,9 @@ MCP 工具与 HTTP 端点**无需改动**，会自动支持新链。
 ## 6. 验证
 
 ```bash
-cargo check --workspace --all-targets   # 零 error 零 warning
-cargo test --workspace                  # 单测
-cargo clippy --workspace --all-targets  # 零警告
+cargo check --workspace --all-targets   # 零 error
+cargo test --workspace                  # 单测（全绿）
+cargo clippy --workspace --all-targets  # 零 error；仅有少量刻意保留的死代码提示（is_block_hash / is_txid_hex 等纯函数 + 单测）
 ```
 
 上线前建议对每条链跑一次真实只读查询（见 `各链 README` 的实测记录）。

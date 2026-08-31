@@ -28,12 +28,19 @@ tokio = { workspace = true }
 # `ckb-hash` 的 `new_blake2b()` 把这两点封装死了，调用方无法写错。
 ckb-hash = "1.1"
 
-# 官方 SDK 只用于**测试**：在 CI 里与 canonical 实现逐字节对拍，
-# 确保本 crate 的手写编解码不偏离官方行为。生产构建不引入它。
-[dev-dependencies]
-# 注意：本 crate 的 `[lib] name` 也叫 `ckb_sdk`（见文件顶部），与官方 crate **同名**，
-# 直接 `use ckb_sdk::..` 会撞车（rustc E0464）。所以这里把官方包重命名后再引用。
+# 官方 ckb-sdk：用于**原生 CKB 转账**（live cell 收集 + 容量平衡 + 系统单签锁签名 + 广播）。
+# 这是 ckb-sdk 5.1.0 的高层 API（`CapacityTransferBuilder` + `CapacityBalancer` +
+# `SecpSighashUnlocker` + `SecpCkbRawKeySigner`），签名路径与链上 secp256k1_blake160
+# 校验完全一致，避免手写 witness 签名踩坑。
+#
+# 注意：本 crate 的 `[lib] name` 也叫 `ckb_sdk`（见文件顶部），与官方包**同名**，
+# 直接 `use ckb_sdk::..` 会撞车（rustc E0464）。所以把官方包重命名为
+# `official-ckb-sdk` 再引用（见 adapter.rs 的 `use official_ckb_sdk::..`）。
 official-ckb-sdk = { package = "ckb-sdk", version = "5.1" }
-# 必须与 Cargo.lock 里 ckb-sdk 依赖的版本**完全一致**，否则会编出两份 ckb-types
-# （rustc 报 E0464：同一 crate 出现多个 rlib 候选）。
+# 下面这些类型被转账实现直接引用，必须声明为正式依赖。
+# 版本必须与 Cargo.lock 里 ckb-sdk 实际依赖的版本**完全一致**，否则会编出多份
+# ckb-types / ckb-jsonrpc-types（rustc 报 E0464：同一 crate 出现多个 rlib 候选）。
 ckb-types = "=1.1.1"
+ckb-jsonrpc-types = "=1.1.1"
+# 与 ckb-sdk 5.1.0 依赖的 `secp256k1 0.30.0` 保持同一份，私钥 → 公钥 → SecretKey 类型才能对齐。
+secp256k1 = { version = "0.30", features = ["recovery"] }

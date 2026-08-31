@@ -9,6 +9,10 @@
 // 这里不是直接调用，而是配合下面的 `#[derive(...)]` 让编译器帮我们生成实现代码。
 use serde::{Deserialize, Serialize};
 
+// `format_units` / `parse_units` 是互逆的纯函数，金额解析失败时统一用核心错误类型，
+// 于是六条新链的 `transfer` 不用各自造一套「非法金额」错误。
+use crate::{ErrorCode, SdkError};
+
 /// 支持的公链。序列化为小写短名。
 ///
 /// 语法说明：
@@ -49,7 +53,6 @@ pub enum ChainKind {
 /// `[&str; 4]` 读作「元素类型为 `&str`、长度为 4 的数组」；
 /// 长度写进类型里，所以 `[&str; 4]` 和 `[&str; 5]` 是两个不同的类型。
 /// `const`（编译期常量）与 `let`（运行期绑定）的区别：`const` 的值会被内联到每处使用点。
-const READ_CAPABILITIES: [&str; 4] = ["status", "balance", "block", "tx"];
 /// 只读 + 公钥派生地址（纯本地计算）。
 const READ_AND_DERIVE_CAPABILITIES: [&str; 5] =
     ["status", "balance", "block", "tx", "address_from_pubkey"];
@@ -197,25 +200,24 @@ impl ChainKind {
 
     /// 该链在统一接口下真实可用的能力清单。
     ///
-    /// 前四条链具备全量能力（含本地签名转账）；六条新链首期提供只读查询，
-    /// 其中五条额外支持纯本地的公钥派生地址，TON 的地址依赖钱包合约 StateInit，
-    /// 无法仅由公钥确定，因此只声明只读能力。
+    /// 除 SUI 外九链（ETH / BTC / SOL / NEAR / APT / AR / CKB / FIL / TON）均具备全量能力
+    /// （含本地签名转账）；SUI 的本地签名转账依赖 `sui-graphql-client` / `sui-sdk-types`，
+    /// 版本同步存在风险，暂不实现，仅声明只读 + 公钥派生地址能力。
     ///
     /// 语法说明：返回值 `&'static [&'static str]` 是「对静态字符串切片数组的引用」，
     /// 拆开读作 `&'static ( [ &'static str ] )`。返回引用而非 `Vec` 是为了零分配：
-    /// 直接把上面三个 `const` 数组的地址交出去。
+    /// 直接把上面 `const` 数组的地址交出去。
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
             // 一个分支里匹配多个变体，用 `|` 分隔。
             // `&FULL_CAPABILITIES`：`&` 取引用，把 `[&str; 6]` 借成 `&[&str]`（切片），
             // 长度信息从类型里「擦除」掉了，这正是返回类型只写 `[..]` 而不写长度的原因。
-            ChainKind::Eth | ChainKind::Btc | ChainKind::Sol | ChainKind::Near => {
+            ChainKind::Eth | ChainKind::Btc | ChainKind::Sol | ChainKind::Near | ChainKind::Apt
+            | ChainKind::Ar | ChainKind::Ckb | ChainKind::Fil | ChainKind::Ton => {
                 &FULL_CAPABILITIES
             }
-            ChainKind::Apt | ChainKind::Ar | ChainKind::Ckb | ChainKind::Fil | ChainKind::Sui => {
-                &READ_AND_DERIVE_CAPABILITIES
-            }
-            ChainKind::Ton => &READ_CAPABILITIES,
+            // SUI 暂缓 transfer（见上方说明）。
+            ChainKind::Sui => &READ_AND_DERIVE_CAPABILITIES,
         }
     }
 
@@ -224,9 +226,19 @@ impl ChainKind {
     /// 语法说明：`matches!(值, 模式)` 是标准库宏，等价于
     /// `match 值 { 模式 => true, _ => false }`，只是更短。末尾的 `!` 表示这是宏而非函数。
     pub fn supports_transfer(self) -> bool {
+        // 除 SUI（转账依赖版本同步不稳定的 sui-graphql-client）外，九链均支持。
+        // 显式列出支持项而非 `!matches!(Sui)`，避免新增链被默认「偷偷」开放转账。
         matches!(
             self,
-            ChainKind::Eth | ChainKind::Btc | ChainKind::Sol | ChainKind::Near
+            ChainKind::Eth
+                | ChainKind::Btc
+                | ChainKind::Sol
+                | ChainKind::Near
+                | ChainKind::Apt
+                | ChainKind::Ar
+                | ChainKind::Ckb
+                | ChainKind::Fil
+                | ChainKind::Ton
         )
     }
 }
@@ -271,6 +283,95 @@ pub fn format_units(amount: u128, decimals: u8) -> String {
     let trimmed = frac_str.trim_end_matches('0');
     // `format!` 宏返回 `String`；这是函数体最后一个表达式，即返回值。
     format!("{integer}.{trimmed}")
+}
+
+/// `parse_units` 是 [`format_units`] 的逆运算：把人类可读的十进制金额字符串，
+/// 按给定精度（小数位数）解析成最小单位的 `u128` 整数。
+///
+/// `"1.5"` + 18 → `1_500_000_000_000_000_000`；`"0.00000042"` + 8 → `42`。
+///
+/// 为什么要有它：转账接口收的是 `"0.01"` 这种人类可读金额（避免 f64 误差），
+/// 而链上金额永远是最小单位的整数，二者之间必须有一个纯整数、无浮点的转换。
+/// 六个新链的 `transfer` 共用本函数，保证「1 APT」在各链都严格等于 `10^decimals`。
+pub fn parse_units(amount: &str, decimals: u8) -> Result<u128, SdkError> {
+    // 先去首尾空白：CLI / HTTP 参数常带换行或空格。
+    let raw = amount.trim();
+    if raw.is_empty() {
+        return Err(SdkError::invalid_argument("金额不能为空"));
+    }
+    // 转账金额不允许为负；负号会让后面的整数解析误判。
+    if raw.starts_with('-') {
+        return Err(SdkError::invalid_argument(format!("金额必须为非负数: {amount}")));
+    }
+    // 拆成整数部分与小数部分。最多允许一个小数点。
+    let (integer_part, fraction_part) = match raw.split_once('.') {
+        Some((i, f)) => {
+            // 小数部分出现非数字（如 "1.2.3" 的第二点会让 split_once 只切一次，
+            // 但 f 里若再含字母就会在下面 is_ascii_digit 检查中暴露）。
+            if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
+                return Err(SdkError::invalid_argument(format!("非法金额: {amount}")));
+            }
+            (i, f)
+        }
+        None => {
+            if !raw.chars().all(|c| c.is_ascii_digit()) {
+                return Err(SdkError::invalid_argument(format!("非法金额: {amount}")));
+            }
+            (raw, "")
+        }
+    };
+
+    // 整数部分为空（".5"）或纯小数点都非法。
+    if integer_part.is_empty() {
+        return Err(SdkError::invalid_argument(format!("非法金额: {amount}")));
+    }
+
+    // 小数部分超过精度：要么截断丢精度（不允许），要么报错。这里选择直接报错，
+    // 因为「1.000000001 BTC」若被悄悄截成 1 BTC 是危险的。
+    let exponent = decimals as u32;
+    let unit = 10u128.pow(exponent);
+    if fraction_part.len() > decimals as usize {
+        return Err(SdkError::invalid_argument(format!(
+            "金额小数位超过该链精度（{decimals} 位）: {amount}"
+        )));
+    }
+
+    // 整数部分：手动按字符累加，避免 u128::from_str 的额外依赖与错误分支。
+    // 同时顺带做一次溢出预检——整数部分本身就超过 u128 必然非法。
+    let mut int_value: u128 = 0;
+    for c in integer_part.chars() {
+        let digit = (c as u8 - b'0') as u128;
+        int_value = int_value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(digit))
+            .ok_or_else(|| SdkError::invalid_argument(format!("金额整数溢出: {amount}")))?;
+    }
+
+    // 小数部分：右补 0 到精度长度后再转整数，再乘以整数部分的 10^decimals。
+    // 例："1.5" decimals=8 → fraction "50000000" = 50_000_000；整数部分 1 * 10^8 = 100_000_000；
+    // 合计 150_000_000（即 1.5 APT in octa）。
+    let mut frac_value: u128 = 0;
+    if !fraction_part.is_empty() {
+        // 右补零到 `decimals` 位。
+        let mut padded = String::with_capacity(decimals as usize);
+        padded.push_str(fraction_part);
+        for _ in fraction_part.len()..decimals as usize {
+            padded.push('0');
+        }
+        for c in padded.chars() {
+            let digit = (c as u8 - b'0') as u128;
+            frac_value = frac_value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(digit))
+                .ok_or_else(|| SdkError::invalid_argument(format!("金额小数溢出: {amount}")))?;
+        }
+    }
+
+    // 最终 = 整数部分 * 10^decimals + 小数部分整数。两项相加仍可能溢出，用饱和检查。
+    int_value
+        .checked_mul(unit)
+        .and_then(|v| v.checked_add(frac_value))
+        .ok_or_else(|| SdkError::new(ErrorCode::InvalidArgument, format!("金额溢出: {amount}")))
 }
 
 /// 单元测试模块。
@@ -321,5 +422,27 @@ mod tests {
         assert_eq!(format_units(42, 8), "0.00000042");
         assert_eq!(format_units(0, 18), "0");
         assert_eq!(format_units(100, 0), "100");
+    }
+
+    #[test]
+    fn parse_units_round_trips() {
+        // 与 `format_units` 互逆：解析结果与原始最小单位整数一致。
+        assert_eq!(parse_units("1.5", 18).unwrap(), 1_500_000_000_000_000_000);
+        assert_eq!(parse_units("1.5", 8).unwrap(), 150_000_000);
+        assert_eq!(parse_units("1.5", 9).unwrap(), 1_500_000_000);
+        assert_eq!(parse_units("0.00000042", 8).unwrap(), 42);
+        assert_eq!(parse_units("100", 0).unwrap(), 100);
+        assert_eq!(parse_units("0", 18).unwrap(), 0);
+        // 小数位不足时右补零。
+        assert_eq!(parse_units("1", 8).unwrap(), 100_000_000);
+    }
+
+    #[test]
+    fn parse_units_rejects_garbage() {
+        assert!(parse_units("", 8).is_err());
+        assert!(parse_units("abc", 8).is_err());
+        assert!(parse_units("-1", 8).is_err());
+        assert!(parse_units("1.2.3", 8).is_err());
+        assert!(parse_units("1.0000000001", 8).is_err()); // 9 位小数 > 精度 8
     }
 }

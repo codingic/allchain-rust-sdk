@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use allchain_core::{
     AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TxStatus, TxView,
+    TransferRequest, TransferView, TxStatus, TxView, parse_units,
 };
 use chain_rpcutil::{Http, field_u64};
 
@@ -251,6 +251,114 @@ impl ChainClient for ArClient {
     /// 注意不是完整的 JWK、也不是 PEM——只取模数那一段。
     async fn address_from_pubkey(&self, pubkey: &str) -> Result<AddressView, SdkError> {
         derive_address(pubkey, &self.network)
+    }
+
+    /// 转账：本地构造、RSA-PSS 签名并广播（`dry_run` 为 `true` 时只签名不广播）。
+    ///
+    /// AR 的「转账」本质是构造一笔 **ANS-104 数据交易**：带 `target` + `quantity`、
+    /// `data` 为空。私钥（JWK JSON）只在本地参与 RSA 签名，绝不外发；
+    /// 广播经由网关的 `POST /tx`。
+    ///
+    /// 领域说明：AR 是全链唯一用 **RSA-4096 + PSS** 的，交易 ID = `base64url(sha256(签名))`，
+    /// 由 arweave-rs 的 `Provider` 完成 deep-hash 与签名，本方法复刻其 `sign_transaction`。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        use arweave_rs::crypto::base64::Base64 as ArBase64;
+        use arweave_rs::crypto::hash::ToItems;
+        use arweave_rs::crypto::sign::Signer as ArSigner;
+        use arweave_rs::crypto::Provider as ArProvider;
+        use arweave_rs::transaction::client::TxClient;
+        use arweave_rs::transaction::Tx;
+        use jsonwebkey::JsonWebKey;
+        use std::str::FromStr;
+        use url::Url;
+
+        // AR 私钥是 JWK JSON；解析出钱包签名器（纯本地，不触网）。
+        let jwk: JsonWebKey = req
+            .private_key
+            .parse()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 AR JWK 私钥: {e}")))?;
+        let signer = ArSigner::from_jwk(jwk);
+        let provider = ArProvider::new(Box::new(signer));
+        let from = provider.wallet_address().to_string();
+
+        // 收款地址：AR 地址固定 43 字符 base64url。
+        validate_address(&req.to)?;
+        let target = ArBase64::from_str(&req.to)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 AR 收款地址: {e}")))?;
+        // 金额：人类可读 AR → winston（u128，精度 12）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+
+        // 用自定义网关构造交易客户端（负责取 last_tx / 估算 fee / 广播）。
+        let base_url = Url::parse(self.rpc_url.trim_end_matches('/'))
+            .map_err(|e| SdkError::invalid_argument(format!("非法 AR 网关 URL: {e}")))?;
+        let tx_client = TxClient::new(reqwest::Client::new(), base_url).map_err(|e| {
+            SdkError::new(ErrorCode::RpcError, format!("构造 AR 交易客户端失败: {e}"))
+        })?;
+
+        let last_tx = tx_client.get_last_tx().await.map_err(|e| {
+            SdkError::new(ErrorCode::RpcError, format!("获取 AR last_tx 失败: {e}"))
+        })?;
+        let fee = tx_client.get_fee(target.clone(), Vec::new()).await.map_err(|e| {
+            SdkError::new(ErrorCode::RpcError, format!("获取 AR 手续费失败: {e}"))
+        })?;
+
+        // 构造一笔「纯转账」交易（data 为空）。
+        let mut tx = Tx::new(
+            &provider,
+            target,
+            Vec::new(),
+            amount_raw,
+            fee,
+            last_tx,
+            vec![],
+            false,
+        )
+        .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造 AR 交易失败: {e}")))?;
+
+        // 本地签名：对交易的 deep hash 做 RSA-PSS 签名，再用签名的 sha256 当交易 ID。
+        let deep_hash_item = tx.to_deep_hash_item().map_err(|e| {
+            SdkError::new(ErrorCode::Internal, format!("AR deep hash 失败: {e}"))
+        })?;
+        let signature_data = provider.deep_hash(deep_hash_item);
+        let signature = provider.sign(&signature_data).map_err(|e| {
+            SdkError::new(ErrorCode::Internal, format!("AR 本地签名失败: {e}"))
+        })?;
+        let id = provider.hash_sha256(&signature.0);
+        tx.signature = signature;
+        tx.id = ArBase64(id.to_vec());
+
+        // dry-run：只签名不广播，返回本地算出的交易 ID。
+        if req.dry_run {
+            let tx_id = tx.id.to_string();
+            let signed_raw = serde_json::to_string(&tx)
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("序列化 AR 交易失败: {e}")))?;
+            return Ok(TransferView::new(
+                ChainKind::Ar,
+                &self.network,
+                Some(from),
+                req.to,
+                amount_raw,
+                Some(tx_id),
+                false,
+            )
+            .with_extra(json!({ "reward": fee, "signed_raw": signed_raw })));
+        }
+
+        // 真发：POST 已签名交易到网关 `/tx`。
+        let (id, reward) = tx_client.post_transaction(&tx).await.map_err(|e| {
+            SdkError::new(ErrorCode::RpcError, format!("广播 AR 交易失败: {e}"))
+        })?;
+        let tx_id = id.to_string();
+        Ok(TransferView::new(
+            ChainKind::Ar,
+            &self.network,
+            Some(from),
+            req.to,
+            amount_raw,
+            Some(tx_id),
+            true,
+        )
+        .with_extra(json!({ "reward": reward, "success": true })))
     }
 }
 

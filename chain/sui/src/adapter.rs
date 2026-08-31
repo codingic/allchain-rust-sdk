@@ -9,7 +9,7 @@
 //! 3. 余额按 **coin type** 区分，`0x2::sui::SUI` 才是原生币，
 //!    其它一切（包括 USDC）都是不同的 coin type。
 //!
-//! 本适配器**只提供只读查询 + 本地地址派生**，不实现 `transfer`。
+//! 本适配器提供只读查询 + 本地地址派生 + **离线构造并签名 `transfer`**（GraphQL 广播）。
 
 // `async_trait` 属性宏：稳定版 Rust 不允许 trait 里直接写 `async fn`
 // （会破坏对象安全），它把 `async fn` 改写成返回装箱 Future 的普通 `fn`，
@@ -26,10 +26,22 @@ use serde_json::{Value, json};
 
 use allchain_core::{
     AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TxStatus, TxView, hexutil,
+    TransferRequest, TransferView, TxStatus, TxView, hexutil,
 };
 // 共用工具层：HTTP 客户端 + 宽松数值解析 + RFC3339 时间解析。
 use chain_rpcutil::{Http, loose_u64, loose_u128, rfc3339_to_unix};
+
+// 本地构造并签名 SUI 交易（Programmable Transaction Block）所需。
+use sui_sdk_types::{
+    Address, Argument, Command, Digest, GasPayment, Input, Intent, IntentAppId, IntentScope,
+    IntentVersion, ObjectReference, ProgrammableTransaction, SignatureScheme, SignedTransaction,
+    SplitCoins, Transaction, TransactionExpiration, TransactionKind, TransferObjects,
+    UserSignature,
+};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use base64::Engine;
+use bcs;
+use std::str::FromStr;
 
 use crate::network;
 
@@ -39,6 +51,10 @@ use crate::network;
 /// 查余额时**必须**指定它，否则拿到的是其它 token 的余额
 /// （甚至可能是空结果，而不是报错——这是 Sui GraphQL 的一个易踩的坑）。
 const SUI_COIN_TYPE: &str = "0x2::sui::SUI";
+
+/// SUI 转账的 gas budget（MIST，精度 9）。0.05 SUI 对单条 PTB 足够宽裕；
+/// 选币时要求 coin 余额 ≥ 转账额 + 该预算，确保同币既作转账源又作 gas 付款。
+const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
 
 /// checkpoint 查询里要取的字段清单，直接插进 GraphQL 选择集。
 ///
@@ -59,6 +75,28 @@ pub struct SuiClient {
     rpc_url: String,
     /// 共用 HTTP 客户端（内含连接池）。
     http: Http,
+}
+
+/// 构造查询某地址 SUI 主币 coin 对象的 GraphQL 查询。
+///
+/// 字段名严格对齐 `sui-graphql-client 0.0.7` 的 `schema.graphql`（`Coin` 的 object id
+/// 字段是 `address` 而非 `coinObjectId`；`balance` 是返回 `Balance` 的方法，须读
+/// `balance { totalBalance }`；`Coin` 无 `type { repr }` 字段，改为用 `coins(type:)` 过滤）。
+fn coins_query(owner: &str) -> String {
+    format!(
+        r#"{{ address(address: "{owner}") {{ coins(first: 50, type: "0x2::sui::SUI") {{ nodes {{ address balance {{ totalBalance }} digest version }} }} }} }}"#
+    )
+}
+
+/// 构造广播已签名交易的 GraphQL mutation。
+///
+/// 对齐 `sui-graphql-client 0.0.7` 的 `schema.graphql`：`executeTransactionBlock` 只接受
+/// `(txBytes, signatures)` 两个参数（**无** `requestType`）；返回 `ExecutionResult`
+/// 只有 `effects`，digest 在 `effects.transactionBlock.digest`，执行状态是枚举 `status`。
+fn broadcast_query(tx_base64: &str, sig_base64: &str) -> String {
+    format!(
+        r#"mutation {{ executeTransactionBlock(txBytes: "{tx_base64}", signatures: ["{sig_base64}"]) {{ effects {{ transactionBlock {{ digest }} status }} }} }}"#
+    )
 }
 
 impl SuiClient {
@@ -114,6 +152,80 @@ impl SuiClient {
             // 必须克隆，因为借用的引用活不过本函数。
             .cloned()
             .ok_or_else(|| SdkError::not_found("checkpoint 不存在"))
+    }
+
+    /// 取出发件人的 `0x2::sui::SUI` coin 列表（GraphQL `address.coins`）。
+    ///
+    /// 只保留原生 SUI coin；其余 coin type 直接跳过（SUI GraphQL 对缺省 `coins`
+    /// 不报错，只是返回所有类型，故在此按 `coinType` 过滤）。
+    async fn fetch_sui_coins(&self, owner: &str) -> Result<Vec<SuiCoin>, SdkError> {
+        let query = coins_query(owner);
+        let data = self.http.graphql(&query).await?;
+        let nodes = data
+            .pointer("/address/coins/nodes")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "SUI coins 查询无 nodes"))?;
+        let mut out = Vec::new();
+        for n in nodes {
+            let object_id = n
+                .get("address")
+                .and_then(Value::as_str)
+                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 address (object id)"))?
+                .to_string();
+            let balance = n
+                .pointer("/balance/totalBalance")
+                .and_then(loose_str_u128)
+                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 balance.totalBalance"))?;
+            let digest = n
+                .get("digest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 digest"))?
+                .to_string();
+            let version = n
+                .get("version")
+                .and_then(|v| loose_u64(v).ok())
+                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 version"))?;
+            out.push(SuiCoin { object_id, balance, digest, version });
+        }
+        Ok(out)
+    }
+
+    /// 取参考 gas 价（GraphQL `epoch.referenceGasPrice`，字符串或数字大整数）。
+    async fn fetch_reference_gas_price(&self) -> Result<u64, SdkError> {
+        let query = "{ epoch { referenceGasPrice } }";
+        let data = self.http.graphql(&query).await?;
+        let v = data
+            .pointer("/epoch/referenceGasPrice")
+            .and_then(loose_str_u128)
+            .or_else(|| {
+                data.pointer("/epoch/referenceGasPrice").and_then(|x| loose_u128(x).ok())
+            })
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "缺 referenceGasPrice"))?;
+        Ok(v as u64)
+    }
+
+    /// 广播已签名的交易（GraphQL `executeTransactionBlock` mutation）。
+    ///
+    /// 返回交易 digest；若执行状态非 `SUCCESS` 则报错。txBytes / signatures 均为 base64。
+    async fn broadcast_tx(&self, tx_base64: &str, sig_base64: &str) -> Result<String, SdkError> {
+        let query = broadcast_query(tx_base64, sig_base64);
+        let data = self.http.graphql(&query).await?;
+        let digest = data
+            .pointer("/executeTransactionBlock/effects/transactionBlock/digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "广播无 digest 返回"))?
+            .to_string();
+        let status = data
+            .pointer("/executeTransactionBlock/effects/status")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        if status != "SUCCESS" {
+            return Err(SdkError::new(
+                ErrorCode::RpcError,
+                format!("SUI 交易执行失败: {status}"),
+            ));
+        }
+        Ok(digest)
     }
 }
 
@@ -343,8 +455,131 @@ impl ChainClient for SuiClient {
     async fn address_from_pubkey(&self, pubkey: &str) -> Result<AddressView, SdkError> {
         derive_address(pubkey, &self.network)
     }
-    // 语法说明：这里**没有** `transfer` 方法，走 `ChainClient` 的默认实现返回 `UNSUPPORTED`。
-    // trait 默认方法让「新链接入」只需实现真正支持的能力。
+
+    /// 转账：本地构造 Programmable Transaction Block、ed25519 签名、GraphQL 广播。
+    ///
+    /// 私钥只参与本地签名，绝不外发。金额为人类可读 SUI（9 位精度），按 `dry_run`
+    /// 决定是否广播。签名封装与 `sign` 程序共用同一套 Intent + ed25519 + UserSignature。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        // 1) 收款地址：必须是规范化 `0x` + 64hex，并取出 32 字节作为 PTB 的 Pure 输入。
+        let to_hex = req.to.trim();
+        validate_address(to_hex)?;
+        let to_bytes = hexutil::decode_hex(to_hex)
+            .map_err(|e| SdkError::invalid_argument(format!("收款地址解析失败: {e}")))?;
+        // 2) 金额：SUI 9 位精度，按整数 MIST 解析（避免浮点误差）。
+        let amount = parse_sui_mist(&req.amount)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 SUI 金额: {e}")))?;
+        // 3) 私钥（0x + 64hex 种子）→ ed25519 密钥对；发件地址由种子派生。
+        let seed = parse_seed(&req.private_key)?;
+        let sk = SigningKey::from_bytes(&seed);
+        let vk = VerifyingKey::from(&sk);
+        let from_hex = address_from_pubkey_bytes(&vk.to_bytes());
+        let sender = Address::from_str(&from_hex)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("发件地址构造失败: {e}")))?;
+
+        // 4) 取出发件人可用 SUI coin + 参考 gas 价。
+        let coins = self.fetch_sui_coins(&from_hex).await?;
+        let coin = coins
+            .into_iter()
+            .find(|c| c.balance >= amount as u128 + DEFAULT_GAS_BUDGET as u128)
+            .ok_or_else(|| {
+                SdkError::invalid_argument(format!(
+                    "没有余额充足的 SUI coin（需 ≥ {} + {} MIST）",
+                    amount, DEFAULT_GAS_BUDGET
+                ))
+            })?;
+        let price = self.fetch_reference_gas_price().await?;
+
+        // 5) coin 同时作为「转账源」与「gas 付款」对象引用。
+        let coin_addr = Address::from_str(&coin.object_id)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("coin 对象地址失败: {e}")))?;
+        let coin_ref = ObjectReference::new(
+            coin_addr,
+            coin.version,
+            Digest::from_str(&coin.digest)
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("coin digest 解析失败: {e}")))?,
+        );
+
+        // 6) 构造 PTB：SplitCoins(coin, [amount]) → TransferObjects([split], to)。
+        let inputs = vec![
+            Input::ImmutableOrOwned(coin_ref.clone()),
+            Input::Pure { value: to_bytes.clone() },
+            Input::Pure {
+                value: amount.to_le_bytes().to_vec(),
+            },
+        ];
+        let commands = vec![
+            Command::SplitCoins(SplitCoins {
+                coin: Argument::Input(0),
+                amounts: vec![Argument::Input(2)],
+            }),
+            Command::TransferObjects(TransferObjects {
+                objects: vec![Argument::Result(0)],
+                address: Argument::Input(1),
+            }),
+        ];
+        let tx = Transaction {
+            kind: TransactionKind::ProgrammableTransaction(ProgrammableTransaction { inputs, commands }),
+            sender,
+            gas_payment: GasPayment {
+                objects: vec![coin_ref],
+                owner: sender,
+                price,
+                budget: DEFAULT_GAS_BUDGET,
+            },
+            expiration: TransactionExpiration::None,
+        };
+
+        // 7) 本地签名：Intent(TransactionData) ‖ BCS(Transaction) → ed25519 → UserSignature。
+        let intent = Intent::new(IntentScope::TransactionData, IntentVersion::V0, IntentAppId::Sui)
+            .to_bytes();
+        let mut msg = intent.to_vec();
+        msg.extend_from_slice(
+            &bcs::to_bytes(&tx)
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("交易序列化失败: {e}")))?,
+        );
+        let sig = sk.sign(&msg);
+        let mut full = vec![SignatureScheme::Ed25519 as u8];
+        full.extend_from_slice(&sig.to_bytes());
+        full.extend_from_slice(&vk.to_bytes());
+        let user_sig = UserSignature::from_bytes(&full)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("签名封装失败: {e}")))?;
+        let signed = SignedTransaction {
+            transaction: tx,
+            signatures: vec![user_sig],
+        };
+        let tx_bytes = bcs::to_bytes(&signed)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("签名交易序列化失败: {e}")))?;
+        let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+        let sig_base64 = base64::engine::general_purpose::STANDARD.encode(&full);
+
+        // 8) dry-run：仅返回本地签名，不广播。
+        if req.dry_run {
+            return Ok(TransferView::new(
+                ChainKind::Sui,
+                &self.network,
+                Some(from_hex.clone()),
+                req.to,
+                amount as u128,
+                Some(hexutil::encode_hex_prefixed(&full)),
+                false,
+            )
+            .with_extra(json!({ "signed_tx_base64": tx_base64 })));
+        }
+
+        // 9) 真发：GraphQL executeTransactionBlock 广播。
+        let digest = self.broadcast_tx(&tx_base64, &sig_base64).await?;
+        Ok(TransferView::new(
+            ChainKind::Sui,
+            &self.network,
+            Some(from_hex),
+            req.to,
+            amount as u128,
+            Some(digest),
+            true,
+        )
+        .with_extra(json!({ "signed_tx_base64": tx_base64 })))
+    }
 }
 
 /// Sui 地址 = blake2b-256(scheme_flag || 公钥字节)。
@@ -396,18 +631,8 @@ fn derive_address(pubkey: &str, network: &str) -> Result<AddressView, SdkError> 
     }
     // 建一个输出长度为 32 字节的 BLAKE2b。
     // `expect` 而非 `?`：32 在合法范围 1..=64 内，失败只可能是程序员错误。
-    let mut hasher = Blake2bVar::new(32).expect("32 字节输出合法");
-    // 语法说明：`&[flag]` 是**单元素数组的借用**，`&[u8; 1]` 会自动
-    // 解引用强制转换成 `&[u8]`，正好匹配 `update` 的参数类型。
-    hasher.update(&[flag]);
-    hasher.update(&key_bytes);
-    // 语法说明：`[0u8; 32]` 是**定长数组**（类型里带长度，存在栈上），
-    // 与 `Vec<u8>`（堆上、长度可变）是两种不同的类型。
-    // `finalize_variable` 接受 `&mut [u8]`，数组可自动借成切片。
-    let mut digest = [0u8; 32];
-    hasher
-        .finalize_variable(&mut digest)
-        .expect("输出缓冲 32 字节");
+    // Sui 地址 = blake2b-256(flag ‖ 公钥)，抽成共享函数供种子派生路径复用。
+    let digest = address_hash(flag, &key_bytes);
     Ok(AddressView::new(
         ChainKind::Sui,
         network,
@@ -426,6 +651,84 @@ fn derive_address(pubkey: &str, network: &str) -> Result<AddressView, SdkError> 
         "flag": format!("0x{flag:02x}"),
         "derivation": "blake2b256(flag || pubkey)",
     })))
+}
+
+/// Sui 地址 = blake2b-256(flag ‖ 公钥)，输出恒为 32 字节。
+///
+/// `derive_address` 与种子派生路径共用，保证「同一公钥字节 + 同一方案」在任何入口
+/// 都派生出同一个地址。
+fn address_hash(flag: u8, pubkey: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2bVar::new(32).expect("32 字节输出合法");
+    // `&[flag]` 是单元素数组的借用，`&[u8; 1]` 自动解引用成 `&[u8]`。
+    hasher.update(&[flag]);
+    hasher.update(pubkey);
+    let mut digest = [0u8; 32];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("输出缓冲 32 字节");
+    digest
+}
+
+/// 由 ed25519 公钥字节直接派生 Sui 地址字符串（`0x` + 64hex）。
+///
+/// 与 `derive_address` 一致，默认按 ed25519（flag = `0x00`）。
+fn address_from_pubkey_bytes(pubkey: &[u8]) -> String {
+    let digest = address_hash(0x00, pubkey);
+    hexutil::encode_hex_prefixed(&digest)
+}
+
+/// 转账用：`TransferRequest.private_key` 是 `0x` + 64hex 的 32 字节种子。
+fn parse_seed(s: &str) -> Result<[u8; 32], SdkError> {
+    let b = hexutil::decode_hex(s.trim())
+        .map_err(|e| SdkError::invalid_argument(format!("私钥格式非法: {e}")))?;
+    if b.len() != 32 {
+        return Err(SdkError::invalid_argument(format!(
+            "私钥种子须为 32 字节，实际 {} 字节",
+            b.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+/// 转账用：人类可读 SUI 金额（如 `"0.01"`）→ 整数 MIST（精度 9），避免浮点误差。
+fn parse_sui_mist(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let int_mist: u128 = int_part
+        .parse::<u128>()
+        .map_err(|e| format!("整数部分非法: {e}"))?
+        .checked_mul(1_000_000_000)
+        .ok_or("金额溢出")?;
+    let frac: u128 = if frac_part.is_empty() {
+        0
+    } else {
+        if frac_part.len() > 9 {
+            return Err("小数精度超过 9 位".into());
+        }
+        let f = frac_part
+            .parse::<u128>()
+            .map_err(|e| format!("小数部分非法: {e}"))?;
+        f.checked_mul(10u128.pow((9 - frac_part.len()) as u32))
+            .ok_or("金额溢出")?
+    };
+    int_mist
+        .checked_add(frac)
+        .ok_or("金额溢出")?
+        .try_into()
+        .map_err(|_| "金额超过 u64 上限".into())
+}
+
+/// 转账用：选出的一条 SUI coin（来自 GraphQL `address.coins`）。
+struct SuiCoin {
+    object_id: String,
+    balance: u128,
+    digest: String,
+    version: u64,
 }
 
 /// 严格校验 Sui 地址：必须是 `0x` + **恰好 64 位**十六进制。
@@ -542,5 +845,127 @@ mod tests {
     #[test]
     fn loose_helpers_accept_strings() {
         assert_eq!(loose_str_u128(&json!("1000000000")).unwrap(), 1_000_000_000);
+    }
+
+    /// 转账金额解析：人类可读 SUI → 整数 MIST（精度 9），无浮点误差。
+    #[test]
+    fn parses_sui_amount_to_mist() {
+        assert_eq!(parse_sui_mist("0.01").unwrap(), 10_000_000);
+        assert_eq!(parse_sui_mist("1").unwrap(), 1_000_000_000);
+        assert_eq!(parse_sui_mist("1.5").unwrap(), 1_500_000_000);
+        assert_eq!(parse_sui_mist("0.000000001").unwrap(), 1);
+        assert_eq!(parse_sui_mist("123.456789012").unwrap(), 123_456_789_012);
+        // 超过 9 位小数、整体溢出都必须被拒。
+        assert!(parse_sui_mist("0.0000000001").is_err());
+        assert!(parse_sui_mist("not-a-number").is_err());
+    }
+
+    /// 由 ed25519 公钥字节派生地址：长度、前缀、确定性都正确。
+    #[test]
+    fn derives_address_from_pubkey_bytes() {
+        let pk = hexutil::decode_hex(&"01".repeat(32)).unwrap();
+        let a1 = address_from_pubkey_bytes(&pk);
+        let a2 = address_from_pubkey_bytes(&pk);
+        assert_eq!(a1, a2, "同一公钥必须派生同一地址");
+        assert!(a1.starts_with("0x"));
+        assert_eq!(a1.len(), 66, "0x + 64 位十六进制");
+    }
+
+    /// 离线验证：构造一笔 SUI 转账交易（PTB）、本地签名，签名能被派生公钥验过，
+    /// 且 UserSignature 封装能原样解回 flag ‖ sig ‖ pubkey。无需任何 RPC。
+    #[test]
+    fn transfer_tx_signs_and_verifies_offline() {
+        use ed25519_dalek::Verifier;
+        // 1) 种子 → 密钥对（与 transfer 运行时一致）。
+        let seed = [7u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let vk = VerifyingKey::from(&sk);
+        let from_hex = address_from_pubkey_bytes(&vk.to_bytes());
+        let sender = Address::from_str(&from_hex).unwrap();
+        // 收款地址（规范化 0x + 64hex）→ 32 字节 Pure 输入。
+        let to_bytes = hexutil::decode_hex(&format!("0x{}", "02".repeat(32))).unwrap();
+        let amount: u64 = 10_000_000;
+
+        // 2) 用一个确定性 digest 造一个对象引用（仅用于离线构造，不接触链）。
+        let coin_ref = ObjectReference::new(sender, 0, Digest::from_bytes(&[0u8; 32]).unwrap());
+        // 3) 构造 PTB：SplitCoins(coin, [amount]) → TransferObjects([split], to)。
+        let tx = Transaction {
+            kind: TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
+                inputs: vec![
+                    Input::ImmutableOrOwned(coin_ref.clone()),
+                    Input::Pure { value: to_bytes.clone() },
+                    Input::Pure { value: amount.to_le_bytes().to_vec() },
+                ],
+                commands: vec![
+                    Command::SplitCoins(SplitCoins {
+                        coin: Argument::Input(0),
+                        amounts: vec![Argument::Input(2)],
+                    }),
+                    Command::TransferObjects(TransferObjects {
+                        objects: vec![Argument::Result(0)],
+                        address: Argument::Input(1),
+                    }),
+                ],
+            }),
+            sender,
+            gas_payment: GasPayment {
+                objects: vec![coin_ref],
+                owner: sender,
+                price: 1000,
+                budget: DEFAULT_GAS_BUDGET,
+            },
+            expiration: TransactionExpiration::None,
+        };
+
+        // 4) 本地签名（与 transfer 运行时同一套 Intent + ed25519 + UserSignature）。
+        let intent = Intent::new(IntentScope::TransactionData, IntentVersion::V0, IntentAppId::Sui)
+            .to_bytes();
+        let mut msg = intent.to_vec();
+        msg.extend_from_slice(&bcs::to_bytes(&tx).unwrap());
+        let sig = sk.sign(&msg);
+        let mut full = vec![SignatureScheme::Ed25519 as u8];
+        full.extend_from_slice(&sig.to_bytes());
+        full.extend_from_slice(&vk.to_bytes());
+
+        // 5) 验签：派生公钥必须认可该签名。
+        assert!(vk.verify(&msg, &sig).is_ok(), "种子重建的密钥对签名验签失败");
+        // 6) UserSignature 封装可原样解回。
+        let user_sig = UserSignature::from_bytes(&full).unwrap();
+        let back = user_sig.to_bytes();
+        assert_eq!(back.as_slice(), full.as_slice(), "UserSignature 往返不一致");
+    }
+
+    #[test]
+    fn coins_query_matches_sui_0_0_7_schema() {
+        let q = coins_query("0xabc");
+        assert!(
+            q.contains("coins(first: 50, type: \"0x2::sui::SUI\")"),
+            "coins 查询应带 type 过滤参数"
+        );
+        assert!(
+            q.contains("address balance { totalBalance }"),
+            "coin 的 object id 字段是 address、余额须读 balance.totalBalance"
+        );
+        assert!(
+            !q.contains("coinObjectId") && !q.contains("type { repr }"),
+            "0.0.7 schema 无 coinObjectId 字段、也无 type-repr 字段"
+        );
+    }
+
+    #[test]
+    fn broadcast_query_matches_sui_0_0_7_schema() {
+        let q = broadcast_query("TX", "SIG");
+        assert!(
+            q.contains("executeTransactionBlock(txBytes: \"TX\", signatures: [\"SIG\"])"),
+            "executeTransactionBlock 仅接受 txBytes + signatures"
+        );
+        assert!(
+            !q.contains("requestType"),
+            "0.0.7 schema 的 executeTransactionBlock 无 requestType 参数"
+        );
+        assert!(
+            q.contains("effects { transactionBlock { digest } status }"),
+            "digest 在 effects.transactionBlock.digest，执行状态是枚举 status"
+        );
     }
 }

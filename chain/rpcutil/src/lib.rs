@@ -297,6 +297,32 @@ impl Http {
             // 塞进 message 会让日志爆掉，缺 data 这一事实本身就够定位了。
             .ok_or_else(|| SdkError::new(ErrorCode::RpcError, "GraphQL 响应缺少 data 字段"))
     }
+
+    /// 发送表单（`application/x-www-form-urlencoded`）POST，解析为 JSON 值。
+    ///
+    /// 为什么需要它：toncenter 的 `sendBoc` 这类写接口走表单 POST 而非 JSON-RPC，
+    /// 但响应同样可能是 `{ok, result}` 信封，适配器复用同一套字段提取即可。
+    ///
+    /// 语法说明：`params` 是借用的元组切片 `&[(&str, &str)]`——reqwest 的 `.form()`
+    /// 要求参数实现 `Serialize`，而 `(&str, &str)` 元组对恰好能序列化成 `k=v&k=v` 表单体。
+    pub async fn post_form(&self, path: &str, params: &[(&str, &str)]) -> Result<Value, SdkError> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self
+            .client
+            .post(&url)
+            .form(params)
+            .send()
+            .await
+            .map_err(|e| transport_error(&url, e))?;
+        let body = read_text(resp, &url).await?;
+        // 与 `get_value` 同样的策略：自己 `from_str` 以便解析失败时把原文塞进错误。
+        serde_json::from_str(&body).map_err(|e| {
+            SdkError::new(
+                ErrorCode::ParseError,
+                format!("解析 {url} 的 JSON 失败: {e}; 原文: {}", truncate(&body)),
+            )
+        })
+    }
 }
 
 /// 读取响应体并判定 HTTP 状态码，是 `get_text` / `get_value` / `jsonrpc` / `graphql`

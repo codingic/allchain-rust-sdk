@@ -10,7 +10,10 @@
 //!    且 CID 在 JSON 里被 Lotus 表示成 `{" / ": "bafy..."}` 这种 IPLD 链接形式，
 //!    取值时必须用 JSON Pointer 的 `~1` 转义（见 `status` 里的注释）。
 //!
-//! 本适配器**只提供只读查询 + 本地地址派生**，不实现 `transfer`。
+//! 本适配器提供只读查询 + 本地地址派生 + **原生转账**：
+//! `transfer` 在本地构造 `fvm_shared::Message`，计算消息 CID（DAG-CBOR + blake2b-256），
+//! 对 `blake2b-256(消息CID)` 做 secp256k1 可恢复签名，dry-run 直接返回签名结果，
+//! 广播则组装 Lotus 形态的 `SignedMessage` JSON 走 `Filecoin.MpoolPush`。
 
 // `async_trait` 属性宏：把 trait 里的 `async fn` 改写成返回装箱 Future 的普通 fn。
 // 稳定版 Rust 目前不允许 trait 里直接写 `async fn`（会破坏对象安全），
@@ -22,11 +25,29 @@ use serde_json::{Value, json};
 
 use allchain_core::{
     AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TxStatus, TxView, hexutil,
+    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 // `chain_rpcutil` 是被各新链共用的 HTTP/JSON-RPC 工具层。
-// 这里只取用三个：`Http`（客户端）、`field_u64`（取 u64 字段）、`loose_u128`（宽松解析大整数）。
-use chain_rpcutil::{Http, field_u64, loose_u128};
+// 这里只取用四个：`Http`（客户端）、`field_u64`（取 u64 字段）、`loose_u128`/`loose_u64`（宽松解析大整数）。
+use chain_rpcutil::{Http, field_u64, loose_u128, loose_u64};
+
+// FIL 原生转账依赖 fvm_shared 的数据模型与签名类型：
+// - `Address`：f0/f1/f2/f3/f4 全协议地址，含 `new_secp256k1` 与 `FromStr`；
+// - `Message`：无签名消息；`Signature`：65 字节可恢复签名；`TokenAmount`：attoFIL 金额；
+// - `RawBytes`：空 params；`to_vec`：DAG-CBOR 编码（消息 CID 的数据源）。
+use fvm_shared::address::Address;
+use fvm_shared::econ::TokenAmount;
+// base64 0.22 的 `encode` 需经 `Engine` trait：`STANDARD.encode(...)`。
+use base64::Engine as _;
+use fvm_shared::message::Message;
+use fvm_ipld_encoding::{RawBytes, to_vec};
+// 构造消息 CID：DAG-CBOR codec = 0x71，multihash 用 blake2b-256（code 0xb220）。
+use cid::Cid;
+use multihash::Multihash;
+
+// k256：secp256k1 可恢复签名。`SigningKey` 用于离线签名，
+// 其 `verifying_key().to_encoded_point(false)` 把验证密钥展开成 65 字节未压缩公钥以派生 f1 地址。
+use k256::ecdsa::SigningKey;
 
 use crate::address;
 // `network::{self, NetworkArg}`：`self` 表示同时把 `network` **模块本身**引入作用域，
@@ -397,9 +418,223 @@ impl ChainClient for FilClient {
             "derivation": "blake2b160(uncompressed_pubkey) + blake2b checksum + base32",
         })))
     }
-    // 语法说明：这里**没有** `transfer` 方法。
-    // 它走 `ChainClient` trait 的默认实现，返回 `UNSUPPORTED`。
-    // 这正是 trait 默认方法的价值：新链接入只需实现自己真正支持的能力。
+    /// 原生 FIL 转账：本地构造并签名 `Message`，dry-run 返回签名、广播走 `MpoolPush`。
+    ///
+    /// 签名约定（与 `fvm_shared::crypto::signature` 的 verify 完全对称）：
+    /// 1. 对 CBOR 编码后的 `Message` 取 blake2b-256，构造 DAG-CBOR + blake2b-256 的 CID；
+    /// 2. 对 `blake2b-256(消息CID)` 的 32 字节摘要做 secp256k1 可恢复签名；
+    /// 3. 签名 = `r(32) || s(32) || recovery_id(1)`，recovery_id 用 `k256` 原生字节
+    ///    （0..=3，**不**加 27，与 Lotus / fvm_shared 一致）。
+    ///
+    /// 私钥格式：32 字节 hex（可选 `0x` 前缀）的 secp256k1 原始私钥；
+    /// 发送方地址由该私钥的公钥经 `Address::new_secp256k1` 派生，故 `req.from` 被忽略。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        // 1. 解析私钥 → 签名密钥 + 发送方地址。
+        let (signing_key, from_addr) = derive_secp256k1_key(&req.private_key)?;
+        let from_str = from_addr.to_string();
+
+        // 2. 解析收款地址：fvm_shared 的 `FromStr` 支持 f0/f1/f2/f3/f4 全协议。
+        let to_addr: Address = req
+            .to
+            .trim()
+            .parse()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 FIL 收款地址 {}: {}", req.to, e)))?;
+
+        // 3. 金额：人类可读 → attoFIL（18 位小数）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+
+        // 4. 取发送方 nonce。
+        let nonce = get_nonce(&self.http, &from_str).await?;
+
+        // 5. 构造未签名消息（gas 先留 0，交给节点估算）。
+        let mut msg = Message {
+            version: 0,
+            from: from_addr,
+            to: to_addr,
+            sequence: nonce,
+            value: TokenAmount::from_atto(amount_raw),
+            method_num: 0,
+            params: RawBytes::new(Vec::new()),
+            gas_limit: 0,
+            gas_fee_cap: TokenAmount::from_atto(0u128),
+            gas_premium: TokenAmount::from_atto(0u128),
+        };
+
+        // 6. 估算 gas（失败则用保守默认，dry_run / 广播都尽量可用）。
+        let gas_estimated = estimate_gas(&self.http, &mut msg).await;
+
+        // 7. 计算消息 CID：CBOR → blake2b-256 → DAG-CBOR multihash。
+        let bz = to_vec(&msg)
+            .map_err(|e| SdkError::new(ErrorCode::ParseError, format!("CBOR 编码消息失败: {e}")))?;
+        let digest = blake2b_256(&bz);
+        let mh = Multihash::<64>::wrap(0xb220, &digest).map_err(|e| {
+            SdkError::new(ErrorCode::ParseError, format!("构造 multihash 失败: {e}"))
+        })?;
+        let cid = Cid::new_v1(0x71, mh);
+        let cid_bytes = cid.to_bytes();
+
+        // 8. 对 `blake2b-256(消息CID)` 做 secp256k1 可恢复签名（65 字节）。
+        let sign_digest = blake2b_256(&cid_bytes);
+        let sig_65 = sign_digest_recoverable(&signing_key, &sign_digest)?;
+
+        let cid_str = cid.to_string();
+
+        // dry-run：只返回本地签名结果，不广播。
+        if req.dry_run {
+            return Ok(TransferView::new(
+                ChainKind::Fil,
+                &self.network,
+                Some(from_str),
+                req.to,
+                amount_raw,
+                Some(cid_str.clone()),
+                false,
+            )
+            .with_extra(json!({
+                "cid": cid_str,
+                "signature": hex::encode(sig_65),
+                "gas_estimated": gas_estimated,
+                "note": "本地已完成 secp256k1 签名（blake2b-256(消息CID) 的 65 字节可恢复签名），未广播",
+            })));
+        }
+
+        // 9. 广播：组装 Lotus 形态的 SignedMessage JSON，调用 MpoolPush。
+        let signed_json = json!({
+            "Message": message_to_lotus_json(&msg),
+            "Signature": { "Type": 1, "Data": base64::engine::general_purpose::STANDARD.encode(sig_65) },
+        });
+        let resp = self
+            .http
+            .jsonrpc("Filecoin.MpoolPush", json!([signed_json]))
+            .await?;
+        // Lotus 把返回的消息 CID 序列化成 IPLD 链接 `{ " / ": "bafy..." }`；
+        // 本地已算出相同的 CID，下列仅作回显佐证，tx_hash 统一用本地 CID。
+        let node_cid = resp.get("/").and_then(Value::as_str).map(|s| s.to_string());
+        Ok(TransferView::new(
+            ChainKind::Fil,
+            &self.network,
+            Some(from_str),
+            req.to,
+            amount_raw,
+            Some(cid_str.clone()),
+            true,
+        )
+        .with_extra(json!({
+            "cid": cid_str,
+            "node_cid": node_cid,
+            "gas_estimated": gas_estimated,
+        })))
+    }
+}
+
+/// 由 32 字节 hex 私钥派生 secp256k1 签名密钥与 f1 发送方地址。
+///
+/// FIL 的发送方完全由私钥决定（只能对持有的密钥签名），故 `req.from` 在 FIL 上被忽略。
+fn derive_secp256k1_key(private_key: &str) -> Result<(SigningKey, Address), SdkError> {
+    let bytes = hexutil::decode_hex(private_key)?;
+    if bytes.len() != 32 {
+        return Err(SdkError::invalid_argument(format!(
+            "FIL 私钥需为 32 字节（64 hex 字符），实际 {} 字节",
+            bytes.len()
+        )));
+    }
+    let signing_key = SigningKey::from_slice(&bytes).map_err(|e| {
+        SdkError::new(ErrorCode::Internal, format!("构造签名密钥失败: {e}"))
+    })?;
+    let verifying_key = signing_key.verifying_key();
+    let pub_point = verifying_key.to_encoded_point(false);
+    let addr = Address::new_secp256k1(pub_point.as_bytes()).map_err(|e| {
+        SdkError::new(ErrorCode::InvalidArgument, format!("派生 f1 地址失败: {e}"))
+    })?;
+    Ok((signing_key, addr))
+}
+
+/// 对 32 字节预哈希做 secp256k1 可恢复签名，输出 65 字节 `r||s||recovery_id`。
+fn sign_digest_recoverable(signing_key: &SigningKey, prehash: &[u8; 32]) -> Result<[u8; 65], SdkError> {
+    let (sig, recid) = signing_key.sign_prehash_recoverable(prehash).map_err(|e| {
+        SdkError::new(ErrorCode::Internal, format!("secp256k1 签名失败: {e}"))
+    })?;
+    let mut out = [0u8; 65];
+    out[..64].copy_from_slice(sig.to_bytes().as_slice());
+    out[64] = recid.to_byte();
+    Ok(out)
+}
+
+/// blake2b-256（32 字节输出）：FIL 消息 CID 与签名摘要都用到它。
+///
+/// 特意用可变输出长度的 `Blake2bVar`（而非固定 32 字节的 `Blake2b`），
+/// 与 `chain/fil/src/address.rs` 里地址派生的 blake2b 用法保持一致。
+fn blake2b_256(data: &[u8]) -> [u8; 32] {
+    use blake2::digest::{Update, VariableOutput};
+    let mut h = blake2::Blake2bVar::new(32).expect("blake2b-256 长度合法");
+    h.update(data);
+    let mut out = [0u8; 32];
+    h.finalize_variable(&mut out).expect("输出缓冲长度匹配");
+    out
+}
+
+/// 取发送方下一笔消息的 nonce（`MpoolGetNonce`）。
+async fn get_nonce(http: &Http, from: &str) -> Result<u64, SdkError> {
+    let v = http.jsonrpc("Filecoin.MpoolGetNonce", json!([from])).await?;
+    loose_u64(&v)
+        .map_err(|_| SdkError::new(ErrorCode::ParseError, format!("解析 nonce 失败: {v}")))
+}
+
+/// 估算 gas：把 gas 全置 0 的模板消息交给 `GasEstimateMessageGas`，
+/// 取回填充好的 `GasLimit` / `GasFeeCap` / `GasPremium`。
+///
+/// 返回 `true` 表示估算成功；节点不支持或报错时回退保守默认（`GasLimit = 2_000_000`），
+/// 此时返回 `false`（dry-run 友好，但广播可能被节点以费率不足拒绝）。
+async fn estimate_gas(http: &Http, msg: &mut Message) -> bool {
+    let template = message_to_lotus_json(msg);
+    match http
+        .jsonrpc(
+            "Filecoin.GasEstimateMessageGas",
+            json!([template, Value::Null, Value::Null]),
+        )
+        .await
+    {
+        Ok(est) => {
+            if let Some(gl) = est.get("GasLimit").and_then(Value::as_u64) {
+                msg.gas_limit = gl;
+            }
+            if let Some(fc) = est
+                .get("GasFeeCap")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u128>().ok())
+            {
+                msg.gas_fee_cap = TokenAmount::from_atto(fc);
+            }
+            if let Some(gp) = est
+                .get("GasPremium")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u128>().ok())
+            {
+                msg.gas_premium = TokenAmount::from_atto(gp);
+            }
+            true
+        }
+        Err(_) => {
+            msg.gas_limit = 2_000_000;
+            false
+        }
+    }
+}
+
+/// 构造 Lotus JSON-RPC 接受的 Message JSON 形态（字段名首字母大写，金额/Params 为字符串/base64）。
+fn message_to_lotus_json(msg: &Message) -> Value {
+    json!({
+        "Version": msg.version,
+        "To": msg.to.to_string(),
+        "From": msg.from.to_string(),
+        "Nonce": msg.sequence,
+        "Value": msg.value.to_string(),
+        "GasLimit": msg.gas_limit,
+        "GasFeeCap": msg.gas_fee_cap.to_string(),
+        "GasPremium": msg.gas_premium.to_string(),
+        "Method": msg.method_num,
+        "Params": base64::engine::general_purpose::STANDARD.encode(msg.params.bytes()),
+    })
 }
 
 /// 宽松解析 u128：优先按「十进制字符串」解析，失败再退回 `loose_u128`。
@@ -461,5 +696,39 @@ mod tests {
             123_456_789_012_345_678_901
         );
         assert_eq!(loose_str_u128(&json!(42)).unwrap(), 42);
+    }
+
+    /// 转账签名的端到端正确性（不依赖网络）。
+    ///
+    /// 用 k256 从「预哈希 + 65 字节签名」恢复公钥，再经 `Address::new_secp256k1`
+    /// 派生地址，必须回推出 `derive_secp256k1_key` 得到的发送方地址。
+    /// 这与 `fvm_shared::crypto::signature::verify` 的内部恢复路径完全一致
+    /// （fvm_shared 的 verify 同样用 k256 的 `recover_from_prehash`），
+    /// 因此该测试等价于「签名能被链上校验通过」的离线证明，
+    /// 唯一前提是签名预哈希 = `blake2b-256(消息CID)`（与 `transfer` 实现一致）。
+    #[test]
+    fn transfer_sign_verify_roundtrip() {
+        use k256::ecdsa::{RecoveryId as KRecId, Signature as KSig, VerifyingKey};
+
+        // 任意 32 字节私钥（非真实资金），仅用于验证签名/恢复闭环。
+        let priv_hex = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let (sk, from_addr) = derive_secp256k1_key(priv_hex).unwrap();
+
+        // 取一段「伪消息 CID 字节」作为签名对象；
+        // 真实路径里这里是 `Cid::new_v1(DagCBOR, blake2b-256(CBOR)).to_bytes()`。
+        let cid_bytes = b"bafy2bzacaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pre = blake2b_256(cid_bytes);
+
+        let sig_65 = sign_digest_recoverable(&sk, &pre).unwrap();
+        assert_eq!(sig_65.len(), 65, "FIL secp256k1 签名必须是 65 字节");
+
+        // 用 k256 恢复公钥，并要求派生地址与发送方一致。
+        let sig = KSig::from_slice(&sig_65[..64]).expect("r||s 应为 64 字节");
+        let rec_id = KRecId::from_byte(sig_65[64]).expect("recovery id 合法");
+        let vk = VerifyingKey::recover_from_prehash(&pre, &sig, rec_id)
+            .expect("应能由签名恢复出公钥");
+        let pt = vk.to_encoded_point(false);
+        let rec_addr = Address::new_secp256k1(pt.as_bytes()).expect("派生 f1 地址");
+        assert_eq!(rec_addr, from_addr, "恢复的地址必须等于发送方地址");
     }
 }

@@ -1,0 +1,53 @@
+[package]
+name = "sign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Offline signer: local HTTP service that generates keys (getprikey) and signs/assembles transactions (signtx) for eth / sol / near / apt / sui / ton"
+
+[[bin]]
+name = "sign"
+path = "src/main.rs"
+
+[dependencies]
+# 统一信封 / 错误码，与 acli 三形态保持一致。
+allchain-core = { workspace = true }
+# HTTP 框架沿用 acli 的 axum 0.8。
+axum = "0.8"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+# 密钥生成。
+rand = "0.8"
+# ETH：secp256k1 可恢复签名 + RLP 交易组装（alloy 已含 keccak256 / k256）。
+k256 = { version = "0.13", features = ["ecdsa"] }
+alloy = { version = "2.1.1", features = ["full"] }
+# ed25519 链（SOL/NEAR/APT/SUI/TON）统一用 ed25519-dalek 做签名/验签。
+ed25519-dalek = "2.2"
+# 地址派生所需哈希原语（APT 用 sha3-256，SUI 用 blake2b-256）。
+sha3 = { workspace = true }
+blake2 = { workspace = true }
+# SOL：交易反序列化 + 签名装配。
+solana-message = { version = "4.4.1", features = ["serde"] }
+solana-pubkey = "4.2.1"
+solana-signature = "3.4.1"
+solana-signer = "3.0.1"
+solana-transaction = { version = "4.1.6", features = ["serde"] }
+solana-keypair = "3.1.2"
+bincode = "1.3"
+# NEAR：borsh 交易序列化（near-primitives 锁定 borsh 0.9）。
+near-crypto = "0.37"
+near-primitives = "0.37"
+borsh = { version = "1.0", features = ["derive"] }
+# APT：RawTransaction / SignedTransaction（BCS）。
+aptos-sdk = "0.4.1"
+bcs = "0.1.6"
+# SUI：Transaction / SignedTransaction / intent 前缀（BCS）。
+sui-sdk-types = { version = "=0.0.7", features = ["serde"] }
+# TON：ed25519 签名（external message 组装需钱包 code/state-init，本服务仅出签名）。
+tonlib-core = "0.26"
+num-bigint = "0.4"

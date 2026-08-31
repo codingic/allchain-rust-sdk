@@ -11,8 +11,9 @@
 //!    所以 `TxView::status` 恒为 `Success`（见 `tx` 里的说明）；
 //! 4. toncenter 免费档限速约 1 req/s，客户端内置**串行节流**（见 `throttle`）。
 //!
-//! 本适配器**只提供只读查询**：既不实现 `transfer`，也不实现 `address_from_pubkey`。
-//! 两者的原因相同——TON 地址依赖钱包合约的 StateInit，无法仅由公钥确定。
+//! 本适配器以只读查询为主，**`transfer` 已实现**（依赖 `tonlib-core` 本地构造并签名钱包
+//! 外部消息，详见 `transfer`）。`address_from_pubkey` 仍不实现——TON 地址依赖钱包合约的
+//! StateInit，无法仅由公钥确定。
 
 // `async_trait` 属性宏：稳定版 Rust 不允许 trait 里直接写 `async fn`，
 // 它把 `async fn` 改写成返回装箱 Future 的普通 `fn`，
@@ -32,11 +33,24 @@ use tokio::time::{Instant, sleep};
 // 多导入反而会触发「未使用导入」警告。
 use allchain_core::{
     BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView, TxStatus,
-    TxView,
+    TxView, TransferRequest, TransferView,
 };
+// `parse_units` 把人类可读的 ton 数量（如 `1.5`）解析成最小单位整数（nanoton），
+// 六条新链的 `transfer` 都依赖它，避免 f64 精度丢失。
+use allchain_core::parse_units;
 // `url_encode` 在这里很关键：TON 的用户友好地址含 `+` 与 `/`，
 // 放进 query 前必须转义，否则 `+` 会被服务端解成空格。
 use chain_rpcutil::{Http, field_u64, loose_u128, url_encode};
+
+// TON 转账需要本地构造并签名「钱包外部消息」，依赖 tonlib-core 的密钥/钱包/Cell 工具。
+use num_bigint::BigUint;
+use tonlib_core::cell::{EMPTY_ARC_CELL};
+use tonlib_core::message::{CommonMsgInfo, InternalMessage, TonMessage, TransferMessage};
+use tonlib_core::tlb_types::tlb::TLB;
+use tonlib_core::wallet::mnemonic::{KeyPair, Mnemonic};
+use tonlib_core::wallet::ton_wallet::TonWallet;
+use tonlib_core::wallet::wallet_version::WalletVersion;
+use tonlib_core::TonAddress;
 
 use crate::network;
 
@@ -207,6 +221,55 @@ impl TonClient {
             // 因为要把值返回出去，借用引用活不过本函数。
             .cloned()
             .ok_or_else(|| SdkError::new(ErrorCode::RpcError, "响应缺少 result 字段"))
+    }
+
+    /// 与 `call` 等价的 POST 版本：先节流，再 `post_form` 发表单，
+    /// 最后用同一套 `{ok, result}` 信封归一化。用于 `sendBoc` 这类写接口。
+    async fn post_call(&self, path: String, params: &[(&str, &str)]) -> Result<Value, SdkError> {
+        self.throttle().await;
+        let value = self.http.post_form(&self.with_key(path), params).await?;
+        if value.get("ok").and_then(Value::as_bool) == Some(false) {
+            let message = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("toncenter 返回 ok=false")
+                .to_string();
+            let code = value.get("code").and_then(Value::as_i64);
+            return Err(match code {
+                Some(404) | Some(422) => SdkError::not_found(message),
+                Some(429) => SdkError::new(ErrorCode::RpcError, format!("toncenter 限流: {message}")),
+                _ => SdkError::new(ErrorCode::RpcError, message),
+            });
+        }
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| SdkError::new(ErrorCode::RpcError, "响应缺少 result 字段"))
+    }
+
+    /// 取钱包 seqno：已激活账户返回 `(seqno, false)`，未初始化账户
+    /// toncenter 返回 `seqno: null`，此时必须 `(0, true)`——附带 StateInit 把钱包部署上链。
+    async fn fetch_seqno(&self, address: &str) -> Result<(u32, bool), SdkError> {
+        let path = format!("/getWalletInformation?address={}", url_encode(address));
+        let info = self.call(path).await?;
+        match info.get("seqno").and_then(Value::as_u64) {
+            Some(s) => Ok((s as u32, false)),
+            None => Ok((0, true)),
+        }
+    }
+
+    /// 广播后定位自身最新交易，构造可查询的 locator `<hash>:<lt>@<address>`。
+    ///
+    /// 用 `Option<String>` 而非 `Result`：广播已成功，这一步只是「锦上添花」地回填
+    /// 一个可查询的 tx_hash；若因传播延迟暂时查不到，返回 `None` 也不影响转账结果。
+    async fn locate_own_tx(&self, address: &str) -> Option<String> {
+        let path = format!("/getTransactions?address={}&limit=1&lt=0&hash=", url_encode(address));
+        let txs = self.call(path).await.ok()?;
+        let first = txs.as_array()?.first()?;
+        let tid = first.get("transaction_id")?;
+        let h = tid.get("hash").and_then(Value::as_str)?;
+        let lt = tid.get("lt").and_then(Value::as_str)?;
+        Some(format!("{h}:{lt}@{address}"))
     }
 }
 
@@ -423,11 +486,118 @@ impl ChainClient for TonClient {
         })))
     }
 
+    /// 发起 TON 原生代币（ton）转账。
+    ///
+    /// 与 EVM 链的根本差异：TON 没有「账户直接签名一笔交易」的概念，转账必须由
+    /// **钱包合约**完成——外部消息（extMsg）携带签名，钱包合约校验后用内部消息
+    /// （intMsg）把 nanoton 转给目标。因此本方法依赖 `tonlib-core` 构造并签名外部消息。
+    ///
+    /// 私钥以 24 词 TON 助记词给出；如需指定钱包版本，写成 `<version>:<mnemonic>`
+    /// （如 `v4r2:word1 ... word24`），否则默认 V4R2（现代 TON 钱包最普遍版本）。
+    ///
+    /// `dry_run` 时只做离线签名、返回 BOC，不广播；`broadcast` 时 POST 到 toncenter。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        validate_address(&req.to)?;
+        let recipient = req
+            .to
+            .parse::<TonAddress>()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 TON 收款地址: {e}")))?;
+
+        // `parse_units` 把人类可读的 ton 解析成最小单位整数 nanoton（精度 9）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+
+        let (version, key_pair) = parse_ton_private_key(&req.private_key)?;
+        let wallet = TonWallet::new(version, key_pair)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造 TON 钱包失败: {e}")))?;
+        let from = wallet.address.to_string();
+
+        // 取钱包 seqno：未激活账户 toncenter 返回 seqno=null，需附带 StateInit 部署上链。
+        let (seqno, add_state_init) = self.fetch_seqno(&from).await?;
+
+        // 构造内部转账消息：bounce=true 让目标为 bounceable 地址时失败可退回；
+        // ihr_disabled/fwd_fee 置 0 是钱包转账的标准写法。
+        let int_msg = InternalMessage {
+            ihr_disabled: true,
+            bounce: true,
+            bounced: false,
+            src: wallet.address.clone(),
+            dest: recipient,
+            value: BigUint::from(amount_raw),
+            ihr_fee: BigUint::from(0u32),
+            fwd_fee: BigUint::from(0u32),
+            created_lt: 0,
+            created_at: 0,
+        };
+        let transfer_msg = TransferMessage::new(
+            CommonMsgInfo::InternalMessage(int_msg),
+            EMPTY_ARC_CELL.clone(),
+        );
+        let int_cell = transfer_msg
+            .build()
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造内部转账消息失败: {e}")))?;
+
+        // 外部消息有效期：当前时间 + 60 秒。超时后节点会拒绝，避免重放。
+        let expire_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("系统时钟异常: {e}")))?
+            .as_secs()
+            + 60) as u32;
+
+        let ext_cell = wallet
+            .create_external_msg(expire_at, seqno, add_state_init, &[int_cell.to_arc()])
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造外部消息失败: {e}")))?;
+
+        if req.dry_run {
+            // 离线签名：把外部消息序列化为 BOC hex，调用方可自行广播。
+            let boc = ext_cell
+                .to_boc_hex(false)
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("序列化 BOC 失败: {e}")))?;
+            Ok(TransferView::new(
+                ChainKind::Ton,
+                &self.network,
+                Some(from),
+                req.to,
+                amount_raw,
+                None,
+                false,
+            )
+            .with_extra(json!({
+                "signed_raw": boc,
+                "wallet_version": format!("{version:?}"),
+                "note": "dry_run：已离线签名，未广播。可将 signed_raw（BOC hex）POST 到 /sendBoc 广播。",
+            })))
+        } else {
+            // 广播：POST BOC 到 toncenter。sendBoc 返回 {ok, result} 信封，post_call 已归一化。
+            let boc = ext_cell
+                .to_boc_b64(false)
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("序列化 BOC 失败: {e}")))?;
+            let _ = self
+                .post_call("/sendBoc".to_string(), &[("boc", boc.as_str())])
+                .await?;
+            // 广播后尝试回填一个可查询的 tx_hash（<hash>:<lt>@<from>），查不到也不算失败。
+            let tx_hash = self.locate_own_tx(&from).await;
+            let queryable = tx_hash.is_some();
+            Ok(TransferView::new(
+                ChainKind::Ton,
+                &self.network,
+                Some(from),
+                req.to,
+                amount_raw,
+                tx_hash,
+                true,
+            )
+            .with_extra(json!({
+                "wallet_version": format!("{version:?}"),
+                "queryable": queryable,
+            })))
+        }
+    }
+
     // 不实现 address_from_pubkey：TON 地址是钱包合约 StateInit 的哈希，
     // 依赖具体钱包合约版本（V3/V4R2/W5…），无法仅由公钥唯一确定，使用 trait 默认 UNSUPPORTED。
     //
-    // 同理也不实现 `transfer`：构造外部消息需要知道钱包合约版本与 seqno，
-    // 这属于「钱包」而非「查询 SDK」的职责。
+    // `transfer` 已实现（见上）：它属于「钱包」职责，依赖 tonlib-core 构造并签名外部消息，
+    // 与只读查询 SDK 的边界不同，但本 SDK 选择一并提供以对齐「十链全支持 transfer」的契约。
 }
 
 /// 解析交易定位符 `<hash>:<lt>@<address>`。
@@ -521,6 +691,64 @@ fn validate_address(raw: &str) -> Result<(), SdkError> {
         )));
     }
     Ok(())
+}
+
+/// 解析 TON 私钥：24 词助记词，可选 `<version>:` 前缀指定钱包版本，默认 V4R2。
+///
+/// 助记词本身不含 `:`，因此出现 `version:...` 形式即视为显式指定钱包版本；
+/// 否则按默认 V4R2 推导。
+fn parse_ton_private_key(input: &str) -> Result<(WalletVersion, KeyPair), SdkError> {
+    let trimmed = input.trim();
+    if let Some((ver, mnem)) = trimmed.split_once(':')
+        && is_known_wallet_version(ver)
+    {
+        let version = parse_wallet_version(ver)?;
+        let key_pair = mnemonic_to_keypair(mnem)?;
+        return Ok((version, key_pair));
+    }
+    let key_pair = mnemonic_to_keypair(trimmed)?;
+    Ok((WalletVersion::V4R2, key_pair))
+}
+
+/// 把助记词字符串推导为 ed25519 密钥对（tonlib-core 的 Mnemonic 实现）。
+fn mnemonic_to_keypair(words: &str) -> Result<KeyPair, SdkError> {
+    let mnemonic = Mnemonic::from_str(words, &None)
+        .map_err(|e| SdkError::invalid_argument(format!("非法 TON 助记词: {e}")))?;
+    mnemonic
+        .to_key_pair()
+        .map_err(|e| SdkError::new(ErrorCode::Internal, format!("推导密钥对失败: {e}")))
+}
+
+/// 把版本关键字（大小写不敏感）映射到 `WalletVersion`。
+fn parse_wallet_version(s: &str) -> Result<WalletVersion, SdkError> {
+    let v = match s.trim().to_ascii_lowercase().as_str() {
+        "v1r1" => WalletVersion::V1R1,
+        "v1r2" => WalletVersion::V1R2,
+        "v1r3" => WalletVersion::V1R3,
+        "v2r1" => WalletVersion::V2R1,
+        "v2r2" => WalletVersion::V2R2,
+        "v3r1" => WalletVersion::V3R1,
+        "v3r2" => WalletVersion::V3R2,
+        "v4r1" => WalletVersion::V4R1,
+        "v4r2" => WalletVersion::V4R2,
+        "v5r1" => WalletVersion::V5R1,
+        "highloadv1r1" => WalletVersion::HighloadV1R1,
+        "highloadv1r2" => WalletVersion::HighloadV1R2,
+        "highloadv2" => WalletVersion::HighloadV2,
+        "highloadv2r1" => WalletVersion::HighloadV2R1,
+        "highloadv2r2" => WalletVersion::HighloadV2R2,
+        other => {
+            return Err(SdkError::invalid_argument(format!(
+                "未知 TON 钱包版本: {other}（支持 v1r1..v4r2 / v5r1 / highload*）"
+            )))
+        }
+    };
+    Ok(v)
+}
+
+/// 判断字符串是否为已知钱包版本（用于区分「version:mnemonic」与含冒号的其它输入）。
+fn is_known_wallet_version(s: &str) -> bool {
+    parse_wallet_version(s).is_ok()
 }
 
 /// 单元测试模块：只测纯函数，网络行为靠集成测试或手工验证。

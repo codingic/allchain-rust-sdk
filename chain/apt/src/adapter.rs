@@ -30,7 +30,7 @@ use sha3::{Digest, Sha3_256};
 
 use allchain_core::{
     AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TxStatus, TxView, hexutil,
+    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 // 各链共用的 HTTP + 值提取工具。命名说明：
 // - `field_u64`：字段缺失时报 ParseError，用于「必须有」的字段；
@@ -39,6 +39,13 @@ use allchain_core::{
 // - `url_encode`：手动百分号编码，因为 Move 的 struct tag 含 `:` `<` `>`，
 //   直接拼进 URL 路径会被服务端拒绝。
 use chain_rpcutil::{Http, field_u64, loose_u64, loose_u128, micros_to_seconds, url_encode};
+// APT 原生转账所需的官方 SDK 原语：ed25519 账户、交易构造器、全节点客户端。
+// 默认 feature 已含 `ed25519`，故 `Ed25519Account` 与 `TransactionBuilder::build_and_sign` 均可用。
+use aptos_sdk::account::Ed25519Account;
+use aptos_sdk::api::FullnodeClient;
+use aptos_sdk::config::AptosConfig;
+use aptos_sdk::transaction::{EntryFunction, TransactionBuilder};
+use aptos_sdk::types::{AccountAddress, ChainId};
 
 use crate::network;
 
@@ -368,6 +375,140 @@ impl ChainClient for AptClient {
         // 委托给自由函数：`&self.network` 传进去是为了让返回的 `AddressView`
         // 也带上网络标记，保持与其它链一致的自解释性。
         derive_address(pubkey, &self.network)
+    }
+
+    /// 转账：本地构造、签名并广播（`dry_run` 为 `true` 时只签名不广播）。
+    ///
+    /// APT 原生币是 Move 资源，转账走 `0x1::aptos_account::transfer(收款方, 金额)`，
+    /// 由 `aptos-sdk` 的 `EntryFunction::apt_transfer` 封装。私钥只在本地参与 ed25519
+    /// 签名，绝不外发；广播经由全节点 REST 的 `submit_and_wait`（BCS 编码）。
+    ///
+    /// 领域说明：交易必须带链 `chain_id`（防重放）与付款方 `sequence_number`
+    /// （防重放 + 定序），二者都从节点实时读取。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        // 先本地校验收款地址，避免把「格式错误」混进上游 404。
+        validate_address(&req.to)?;
+        let to_addr = AccountAddress::from_hex(&req.to)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 APT 收款地址: {e}")))?;
+        // 人类可读金额 → 最小单位 octa（u128），再降到 u64（APT 单笔上限约 1.8e19 octa < 2^64）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+        let amount_u64: u64 = amount_raw.try_into().map_err(|_| {
+            SdkError::invalid_argument("金额超出 u64 范围（APT 单笔上限约 1.8e19 octa）")
+        })?;
+
+        // 私钥 → 本地 ed25519 账户（纯本地，不触网）；其地址即付款方。
+        let account = Ed25519Account::from_private_key_hex(&req.private_key)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 APT 私钥: {e}")))?;
+        let from = account.address().to_string();
+
+        // 链 ID：构造交易必填。取账本信息的 `chain_id` 字段。
+        let ledger = self.ledger_info().await?;
+        let chain_id_u8 = ledger
+            .get("chain_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "账本信息缺少 chain_id"))?;
+
+        // 付款方序列号：账户不存在（全新）时序列号为 0，但仍要读一次确认可读。
+        let account_data = self.http.get_value(&format!("/accounts/{from}")).await?;
+        let sequence_number = account_data
+            .get("sequence_number")
+            .and_then(loose_u64_opt)
+            .ok_or_else(|| {
+                SdkError::new(
+                    ErrorCode::ParseError,
+                    format!("无法读取付款方 {from} 的序列号"),
+                )
+            })?;
+
+        // gas 单价：优先用节点估算，失败回退默认 100 octas（APT 常规水平）。
+        let gas_unit_price = self
+            .http
+            .get_value("estimate_gas_price")
+            .await
+            .ok()
+            .and_then(|g| g.get("gas_estimate").and_then(loose_u64_opt))
+            .unwrap_or(100);
+
+        // 构造 `0x1::aptos_account::transfer` 的 entry function payload。
+        let payload = EntryFunction::apt_transfer(to_addr, amount_u64)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造转账 payload 失败: {e}")))?;
+
+        // 组装原始交易并本地签名。收款方首次收款时账户需被创建，gas 上限放宽到 500_000。
+        let signed = TransactionBuilder::new()
+            .sender(account.address())
+            .sequence_number(sequence_number)
+            .payload(payload.into())
+            .chain_id(ChainId::new(chain_id_u8 as u8))
+            .max_gas_amount(500_000)
+            .gas_unit_price(gas_unit_price)
+            .expiration_from_now(600)
+            .build_and_sign(&account)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("本地签名失败: {e}")))?;
+
+        // dry-run：只签名不广播，返回本地算出的交易哈希（签名后 BCS 的 SHA3-256）。
+        if req.dry_run {
+            let hash = signed
+                .hash()
+                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("计算交易哈希失败: {e}")))?
+                .to_string();
+            let signed_raw = hexutil::encode_hex(
+                &aptos_sdk::aptos_bcs::to_bytes(&signed)
+                    .map_err(|e| SdkError::new(ErrorCode::Internal, format!("序列化交易失败: {e}")))?,
+            );
+            return Ok(TransferView::new(
+                ChainKind::Apt,
+                &self.network,
+                Some(from),
+                req.to,
+                amount_raw,
+                Some(hash),
+                false,
+            )
+            .with_extra(json!({
+                "chain_id": chain_id_u8,
+                "sequence_number": sequence_number,
+                "gas_unit_price": gas_unit_price,
+                "max_gas_amount": 500_000,
+                "signed_raw": signed_raw,
+            })));
+        }
+
+        // 真发：用自定义 RPC URL 构造全节点客户端，BCS 广播并等上链。
+        let client = FullnodeClient::new(AptosConfig::custom(&self.rpc_url).map_err(|e| {
+            SdkError::new(ErrorCode::RpcError, format!("构造 APT 客户端失败: {e}"))
+        })?)
+        .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("构造 APT 客户端失败: {e}")))?;
+        let resp = client
+            .submit_and_wait(&signed, None)
+            .await
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("广播 APT 交易失败: {e}")))?;
+
+        let tx_hash = resp
+            .data
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "广播响应缺少交易哈希"))?;
+        let success = resp
+            .data
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        Ok(TransferView::new(
+            ChainKind::Apt,
+            &self.network,
+            Some(from),
+            req.to,
+            amount_raw,
+            Some(tx_hash),
+            true,
+        )
+        .with_extra(json!({
+            "success": success,
+            "sequence_number": sequence_number,
+            "chain_id": chain_id_u8,
+        })))
     }
 }
 

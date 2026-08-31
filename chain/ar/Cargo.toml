@@ -20,3 +20,9 @@ tokio = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 arweave-rs = "0.2"
+# AR 转账用到 arweave-rs 的签名原语与交易客户端：
+# - `jsonwebkey` 把 JWK 私钥字符串解析成密钥（arweave-rs 的依赖，版本对齐避免双份）；
+# - `reqwest` 0.11 / `url` 与 arweave-rs 自身依赖同版本，由 cargo 自动合并，不重复编译。
+jsonwebkey = "0.3.4"
+reqwest = "0.11.20"
+url = "2"

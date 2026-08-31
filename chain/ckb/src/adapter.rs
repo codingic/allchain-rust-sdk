@@ -11,14 +11,38 @@
 //! - `get_cells` 是**游标分页**的，且默认只返回有限条，
 //!   因此余额必须翻页累加（见 `sum_capacity`）。
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use allchain_core::{
     AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TxStatus, TxView, hexutil,
+    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 use chain_rpcutil::{Http, loose_u64, loose_u128};
+
+// 原生转账依赖的官方 ckb-sdk（在 Cargo.toml 里已重命名为 `official-ckb-sdk`，
+// 以避免与本 crate 的 `[lib] name = "ckb_sdk"` 撞车）。
+use ckb_jsonrpc_types::{OutputsValidator, TransactionView as JsonTransactionView};
+use ckb_types::{
+    bytes::Bytes,
+    core::{BlockView as CoreBlockView, ScriptHashType},
+    packed::{CellOutput, Script, WitnessArgs},
+    prelude::*,
+};
+use official_ckb_sdk::{
+    constants::SIGHASH_TYPE_HASH,
+    rpc::CkbRpcClient,
+    traits::{
+        DefaultCellCollector, DefaultCellDepResolver, DefaultHeaderDepResolver,
+        DefaultTransactionDependencyProvider, SecpCkbRawKeySigner, Signer,
+    },
+    tx_builder::{transfer::CapacityTransferBuilder, CapacityBalancer, TxBuilder},
+    unlock::{ScriptUnlocker, SecpSighashUnlocker},
+    Address, ScriptId, SECP256K1,
+};
+use secp256k1::{PublicKey, SecretKey};
 
 // `use crate::address::{self, LockScript}`：`self` 表示「模块本身也一起导入」，
 // 于是既能写 `address::encode_address(..)`，又能直接写 `LockScript`。
@@ -443,6 +467,159 @@ impl ChainClient for CkbClient {
             "lock_args": format!("0x{}", hexutil::encode_hex(&blake160)),
         })))
     }
+
+    /// 原生 CKB 转账：收集发送方 live cell → 组装交易（含找零）→ 系统单签锁签名 → 广播。
+    ///
+    /// 实现说明（对照 ckb-sdk 5.1.0 `examples/chain_transfer_sighash.rs`）：
+    /// - 发送方 lock script 由私钥本地派生（blake160(压缩公钥) + 系统 SIGHASH code_hash）；
+    /// - cell 收集走 `DefaultCellCollector`（底层用 ckb-indexer，与现有 `sum_capacity` 同一端点约定）；
+    /// - 容量平衡与找零由 `CapacityBalancer` 处理，手续费按 `fee_rate` 估算；
+    /// - 签名由 `SecpSighashUnlocker` + `SecpCkbRawKeySigner` 完成，与链上
+    ///   secp256k1_blake160_sighash_all 校验路径一致；
+    /// - `dry_run = true` 时只构建并签名、不广播（仍需要节点做 cell 收集）。
+    ///
+    /// 注意 CKB 的 UTXO 语义：转账金额是「接收方 output 的 capacity」，不含找零；
+    /// 找零 cell 由 `CapacityBalancer` 自动加回发送方。
+    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
+        // 1) 私钥 → 发送方公钥 → SecretKey（ckb-sdk 签名器要求 `secp256k1::SecretKey`）。
+        let priv_bytes = hexutil::decode_hex(&req.private_key)
+            .map_err(|e| SdkError::invalid_argument(format!("CKB 私钥非法: {e}")))?;
+        if priv_bytes.len() != 32 {
+            return Err(SdkError::invalid_argument(format!(
+                "CKB 私钥需为 32 字节，实际 {} 字节",
+                priv_bytes.len()
+            )));
+        }
+        let secret_key = SecretKey::from_slice(&priv_bytes)
+            .map_err(|e| SdkError::invalid_argument(format!("CKB 私钥非法: {e}")))?;
+        let sender_pubkey = PublicKey::from_secret_key(&SECP256K1, &secret_key);
+
+        // 2) 发送方 lock script（ckb-types `Script`）+ 人类可读地址（用于回显 from）。
+        let sender_blake160 = address::ckb_blake160(&sender_pubkey.serialize());
+        let sender_script = Script::new_builder()
+            .code_hash(SIGHASH_TYPE_HASH.pack())
+            .hash_type(ScriptHashType::Type)
+            .args(Bytes::from(sender_blake160.to_vec()).pack())
+            .build();
+        let sender_address =
+            address::encode_address(&LockScript::sighash_blake160(sender_blake160), self.is_mainnet);
+
+        // 3) 接收方地址解析为 lock script（ckb-sdk 的 `Address` 走官方 bech32 解析）。
+        let receiver: Address = req
+            .to
+            .trim()
+            .parse()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 CKB 接收方地址: {e}")))?;
+        let receiver_script = Script::from(&receiver);
+
+        // 4) 金额：统一 `TransferRequest.amount` 按人类可读 CKB（如 "1.5"）解析为 shannon。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+        let capacity: u64 = amount_raw
+            .try_into()
+            .map_err(|_| SdkError::invalid_argument("CKB 转账金额超出 capacity 上限"))?;
+        // 单个 cell 的 capacity 不能低于系统最小容量（61 CKB），否则节点会拒收。
+        if capacity < official_ckb_sdk::constants::MIN_SECP_CELL_CAPACITY {
+            return Err(SdkError::invalid_argument(format!(
+                "CKB 单笔转账金额不能低于 {} shannon（约 {} CKB）",
+                official_ckb_sdk::constants::MIN_SECP_CELL_CAPACITY,
+                official_ckb_sdk::constants::MIN_SECP_CELL_CAPACITY
+                    / official_ckb_sdk::constants::ONE_CKB
+            )));
+        }
+
+        // 5) 组装 unlocker（签名器持有发送方私钥）。
+        let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![secret_key]);
+        let sighash_unlocker = SecpSighashUnlocker::from(Box::new(signer) as Box<dyn Signer>);
+        let sighash_script_id = ScriptId::new_type(SIGHASH_TYPE_HASH);
+        let mut unlockers: HashMap<ScriptId, Box<dyn ScriptUnlocker>> = HashMap::default();
+        unlockers.insert(
+            sighash_script_id,
+            Box::new(sighash_unlocker) as Box<dyn ScriptUnlocker>,
+        );
+
+        // 6) 容量平衡器：发送方 lock script 作为 capacity provider，占位 witness 为 65 字节签名槽。
+        let placeholder_witness = WitnessArgs::new_builder()
+            .lock(Some(Bytes::from(vec![0u8; 65])).pack())
+            .build();
+        let mut balancer = CapacityBalancer::new_simple(sender_script, placeholder_witness, 1000);
+        // 最大手续费上限，避免手续费估算失控。
+        balancer.set_max_fee(Some(100_000_000));
+
+        // 7) 各 resolver / collector（均复用 `self.rpc_url`，与现有查询同一端点）。
+        let mut cell_collector = DefaultCellCollector::new(self.rpc_url.as_str());
+        let tx_dep_provider = DefaultTransactionDependencyProvider::new(self.rpc_url.as_str(), 10);
+        let ckb_client = CkbRpcClient::new(self.rpc_url.as_str());
+        let genesis_block = ckb_client
+            .get_block_by_number(0.into())
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("获取创世区块失败: {e}")))?
+            .ok_or_else(|| SdkError::new(ErrorCode::RpcError, "创世区块不存在"))?;
+        let cell_dep_resolver = DefaultCellDepResolver::from_genesis(&CoreBlockView::from(genesis_block))
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("解析 cell dep 失败: {e}")))?;
+        let header_dep_resolver = DefaultHeaderDepResolver::new(self.rpc_url.as_str());
+
+        // 8) 构建并签名交易。
+        let output = CellOutput::new_builder()
+            .lock(receiver_script)
+            .capacity(capacity)
+            .build();
+        let builder = CapacityTransferBuilder::new(vec![(output, Bytes::default())]);
+        let (tx, still_locked) = builder
+            .build_unlocked(
+                &mut cell_collector,
+                &cell_dep_resolver,
+                &header_dep_resolver,
+                &tx_dep_provider,
+                &balancer,
+                &unlockers,
+            )
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("构建 CKB 交易失败: {e}")))?;
+        if !still_locked.is_empty() {
+            return Err(SdkError::new(
+                ErrorCode::RpcError,
+                "存在未被解锁的 lock group，转账失败（接收方/发送方脚本不支持？）",
+            ));
+        }
+
+        // 9) 序列化并决定广播与否。
+        let json_tx = JsonTransactionView::from(tx.clone());
+        let n_inputs = json_tx.inner.inputs.len();
+        let n_outputs = json_tx.inner.outputs.len();
+        let n_cell_deps = json_tx.inner.cell_deps.len();
+
+        let tx_hash: String = if req.dry_run {
+            // 未广播：交易哈希由本地计算（与广播后节点返回的一致）。
+            format!("0x{}", hexutil::encode_hex(json_tx.hash.as_bytes()))
+        } else {
+            let ckb_client = CkbRpcClient::new(self.rpc_url.as_str());
+            let hash = ckb_client
+                .send_transaction(json_tx.inner, Some(OutputsValidator::Passthrough))
+                .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("广播 CKB 交易失败: {e}")))?;
+            format!("0x{}", hexutil::encode_hex(hash.as_bytes()))
+        };
+
+        Ok(TransferView::new(
+            ChainKind::Ckb,
+            &self.network,
+            Some(sender_address),
+            req.to,
+            amount_raw,
+            Some(tx_hash.clone()),
+            !req.dry_run,
+        )
+        .with_extra(json!({
+            "tx_hash": tx_hash,
+            "dry_run": req.dry_run,
+            "note": if req.dry_run {
+                "已构建并签名，未广播（dry_run）"
+            } else {
+                "已广播到 CKB 节点"
+            },
+            "inputs": n_inputs,
+            "outputs": n_outputs,
+            "cell_deps": n_cell_deps,
+            "from_script_args": format!("0x{}", hexutil::encode_hex(&sender_blake160)),
+        })))
+    }
 }
 
 /// `hash_type` 数值 → CKB JSON-RPC 要求的字符串。
@@ -569,5 +746,40 @@ mod tests {
         // 不带 `0x` 前缀要被拒——这与 apt 的宽松策略不同，是 CKB 的硬性要求。
         assert!(validate_txid(&"ab".repeat(32)).is_err());
         assert!(is_txid_hex(&format!("0x{}", "ab".repeat(32))));
+    }
+
+    #[test]
+    fn transfer_derives_sender_address_offline() {
+        // 离线验证 `transfer` 里的「私钥 → 发送方地址」派生路径，避免任何 RPC。
+        // 测试私钥仅为向量用途，切勿用于真实资金。
+        let priv_hex = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let priv_bytes = hexutil::decode_hex(priv_hex).unwrap();
+        assert_eq!(priv_bytes.len(), 32);
+        let secret_key = SecretKey::from_slice(&priv_bytes).unwrap();
+        let pubkey = PublicKey::from_secret_key(&SECP256K1, &secret_key);
+
+        // 严格复刻 transfer 里的派生逻辑（与 adapter.rs 同一套零件）。
+        let blake160 = address::ckb_blake160(&pubkey.serialize());
+        let lock = LockScript::sighash_blake160(blake160);
+        let mainnet_addr = address::encode_address(&lock, true);
+        let testnet_addr = address::encode_address(&lock, false);
+
+        // 1) 与地址模块自己的「压缩公钥 → 地址」函数结果完全一致，
+        //    锁死 transfer 用的是正确的 code_hash / hash_type（type=1）。
+        assert_eq!(
+            mainnet_addr,
+            address::address_from_compressed_pubkey(&hexutil::encode_hex(&pubkey.serialize()), true)
+                .unwrap()
+        );
+        // 2) 主网/测试网前缀正确（ckb1 / ckt1）。
+        assert!(mainnet_addr.starts_with("ckb1"));
+        assert!(testnet_addr.starts_with("ckt1"));
+        // 3) 往返：编码 → 解码必须还原出同一 lock 与「是否主网」标识。
+        let (decoded, is_main) = address::decode_address(&mainnet_addr).unwrap();
+        assert!(is_main);
+        assert_eq!(decoded, lock);
+        // 4) 非 32 字节私钥必须被 `SecretKey::from_slice` 拒绝，
+        //    对应 transfer 里「私钥需为 32 字节」的长度守卫。
+        assert!(SecretKey::from_slice(&priv_bytes[..31]).is_err());
     }
 }

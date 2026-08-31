@@ -6,7 +6,7 @@
 - 返回**结构完全一致**的 JSON 信封，错误码跨链统一，agent 无需按链分支解析；
 - 前四链基于官方 Rust SDK（alloy、rust-bitcoin、solana-rpc-client、near-jsonrpc-client）；后六链为避免拖入庞大依赖树，统一走共享轻量 HTTP 库 `chain-rpcutil`（REST / JSON-RPC / GraphQL）直连公共端点。
 
-> **能力边界**：十链全部支持只读四件套 `status` / `balance` / `block-height` + `block-by-height` / `tx` 与本地 `address_from_pubkey`（TON 除外，其地址由钱包合约 StateInit 决定、不能仅由公钥派生）；`transfer` 本地签名目前仅 ETH / BTC / SOL / NEAR 实现，其余六链返回 `UNSUPPORTED`。`acli chains` 可查看每链实时能力清单。
+> **能力边界**：十链全部支持只读四件套 `status` / `balance` / `block-height` + `block-by-height` / `tx` 与本地 `address_from_pubkey`（TON 除外，其地址由钱包合约 StateInit 决定、不能仅由公钥派生）；`transfer` 本地签名已实现 **ETH / BTC / SOL / NEAR / APT / AR / CKB / FIL / TON 九链**，仅 **SUI** 暂缓（其转账依赖版本同步不稳定的 `sui-graphql-client`，暂未接入）。`acli chains` 可查看每链实时能力清单。
 
 ---
 
@@ -119,7 +119,7 @@ acli mcp
 | `chain_block_by_height` | `chain`, `height` | 按高度查块（含父哈希、时间戳、交易数、gas）；SOL 传 slot，SUI 传 checkpoint 序号，TON 传 masterchain seqno |
 | `chain_tx` | `chain`, `hash` | 交易（NEAR 需 `<hash>@<account>`，TON 需 `<hash>:<lt>@<address>`） |
 | `chain_address_from_pubkey` | `chain`, `pubkey` | 公钥 → 地址（本地计算；TON 不支持） |
-| `chain_transfer` | `chain`, `to`, `amount` | 原生资产转账（**仅 eth/btc/sol/near**；可选 `private_key` / `dry_run` / `from`） |
+| `chain_transfer` | `chain`, `to`, `amount` | 原生资产转账（**eth/btc/sol/near/apt/ar/ckb/fil/ton 九链**；SUI 暂缓；可选 `private_key` / `dry_run` / `from`） |
 
 除 `chain_catalog` 外都可选 `network` 与 `rpc_url`。
 `chain_balance` 另接受别名 `chain_get_balance` / `get_balance` / `getbalance`；
@@ -259,7 +259,7 @@ acli address-from-pubkey --chain sui  --pubkey [ed25519:|secp256k1:]<hex>
 
 必须知道的坑：
 
-1. **十链默认就是主网**。只读查询无风险；`transfer` 直接动主网资金（仅前四链支持），务必先 `--dry-run` 确认收款方与 `--network`，切测试网要显式指定。
+1. **十链默认就是主网**。只读查询无风险；`transfer` 直接动主网资金（除 SUI 外九链支持，务必先 `--dry-run` 确认收款方与 `--network`，切测试网要显式指定。SUI 的 transfer 暂未实现，调用会返回 `UNSUPPORTED`）。
 2. **SOL 按 slot 查区块**，不是区块高度，用 `block-by-height --height <slot>` 传 slot；公共节点只保留最近约 1–2 天的区块，mainnet 公共端点对 `getBlock` 限流较严，生产建议换私有 RPC。
 3. **NEAR 查交易必须带发送者**：`--hash <tx_hash>@<sender.near>`。历史交易还要改用归档端点 `--rpc-url https://archival-rpc.mainnet.near.org`。
 4. **BTC 的 `--rpc-url` 是 Esplora 索引器地址**，不是 bitcoind 的 JSON-RPC 端点；余额、UTXO 类查询必须有索引器。
@@ -282,7 +282,8 @@ allchain-rust-sdk/
 │   ├── btc/              rust-bitcoin 0.32  + adapter（官方 SDK，含 transfer）
 │   ├── sol/              solana-rpc 4.2     + adapter（同步 API，内部 spawn_blocking，含 transfer）
 │   ├── near/             near-jsonrpc 0.22  + adapter（官方 SDK，含 transfer）
-│   ├── apt/ ar/ ckb/ fil/ sui/ ton/  六新链 adapter（rpcutil 直连，只读 + 地址派生）
+│   ├── apt/ ar/ ckb/ fil/ ton/  五新链 adapter（rpcutil 直连，含本地签名 transfer）
+│   ├── sui/                     新链 adapter（rpcutil 直连，只读 + 地址派生；transfer 暂缓）
 └── acli/                 统一门面：CLI / HTTP / MCP 三种形态
 ```
 

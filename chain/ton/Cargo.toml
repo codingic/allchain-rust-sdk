@@ -18,3 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tonlib-core = "0.26"
+# TON 内部转账消息的金额字段是 `num_bigint::BigUint`（tonlib-core 的公开类型），
+# 构造 `InternalMessage` 时必须显式引入，否则即便它是传递依赖也无法在源码里引用。
+num-bigint = "0.4"

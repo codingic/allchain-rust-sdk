@@ -27,6 +27,9 @@ pub mod traits;
 // 于是这些类型同时拥有两个可用路径：`allchain_core::error::SdkError`
 // 与 `allchain_core::SdkError`。
 pub use chain::ChainKind;
+// `parse_units` 是 `format_units` 的逆运算，六条新链的 `transfer` 都依赖它把人类可读金额
+// 解析成最小单位整数；重导出到根路径，调用方写 `allchain_core::parse_units` 即可。
+pub use chain::parse_units;
 pub use envelope::Envelope;
 pub use error::{ErrorCode, SdkError};
 // 大括号里可以一次导入多个条目，不必写多行 `pub use`。

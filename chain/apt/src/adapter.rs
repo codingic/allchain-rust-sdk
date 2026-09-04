@@ -29,8 +29,9 @@ use serde_json::{Value, json};
 use sha3::{Digest, Sha3_256};
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest,
+    TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 // 各链共用的 HTTP + 值提取工具。命名说明：
 // - `field_u64`：字段缺失时报 ParseError，用于「必须有」的字段；
@@ -377,6 +378,135 @@ impl ChainClient for AptClient {
         derive_address(pubkey, &self.network)
     }
 
+    /// 无私钥转账第一步：组装交易，返回待签消息与交易外壳。
+    ///
+    /// 领域说明——本链有两个与其它链不同的约束：
+    /// 1. **必须显式给 `public_key`**。Aptos 的地址是 `sha3_256(公钥 || 0x00)`，
+    ///    哈希不可逆；REST 的账户接口也只回 `authentication_key`（同样是哈希）。
+    ///    因此没有「从地址反推」这条退路，缺了就直接报错。
+    /// 2. **待签消息不是 32 字节摘要**，而是
+    ///    `sha3_256("APTOS::RawTransaction") || bcs(RawTransaction)`，
+    ///    长度随 payload 变化。ed25519 直接对它签名，**不要再哈希一次**。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        // 地址与金额都是纯本地解析，先做——让错误尽早、便宜地暴露。
+        validate_address(&req.from)?;
+        validate_address(&req.to)?;
+        let sender = AccountAddress::from_hex(&req.from)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 APT 付款地址: {e}")))?;
+        let receiver = AccountAddress::from_hex(&req.to)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 APT 收款地址: {e}")))?;
+
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+        let amount_u64: u64 = amount_raw.try_into().map_err(|_| {
+            SdkError::invalid_argument("金额超出 u64 范围（APT 单笔上限约 1.8e19 octa）")
+        })?;
+
+        // Aptos 的 authenticator 里要写公钥，而地址推不出它——必须调用方给。
+        let public_key = req
+            .public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                SdkError::invalid_argument(
+                    "APT 构造交易必须显式提供 public_key：\
+                     地址是 sha3_256(公钥 || 0x00)，无法反推；\
+                     请传 32 字节 ed25519 公钥（0x + 64 位十六进制）",
+                )
+            })?;
+        let public_key_bytes = parse_ed25519_public_key(public_key)?;
+
+        let unsigned = crate::tx::build_unsigned_transfer(
+            &self.http,
+            sender,
+            &public_key_bytes,
+            receiver,
+            amount_u64,
+            // 10 分钟内签完并广播；过期后节点直接拒收。
+            600,
+        )
+        .await?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Apt,
+            &self.network,
+            req.from,
+            req.to,
+            amount_raw,
+            unsigned.unsigned_tx_hex,
+            unsigned.signing_payload_hex.clone(),
+            "ed25519",
+            // payload 已带 `APTOS::RawTransaction` 域名前缀，
+            // ed25519 直接签它，无需再哈希（故记为 none）。
+            "none",
+        )
+        .with_extra(json!({
+            "public_key": hexutil::encode_hex_prefixed(&public_key_bytes),
+            "sequence_number": unsigned.sequence_number,
+            "chain_id": unsigned.chain_id,
+            "gas_unit_price": unsigned.gas_unit_price,
+            "max_gas_amount": unsigned.max_gas_amount,
+            "expiration_timestamp_secs": unsigned.expiration_timestamp_secs,
+            "payload_function": "0x1::aptos_account::transfer",
+            // 明确写出「怎么把签名装回去」：覆盖外壳最后 64 字节。
+            "splice": "replace_last_64_bytes",
+            "signature_length": 64,
+            "note": "对 signing_payload_hex 整段做一次 ed25519 签名，\
+                     用得到的 64 字节覆盖 unsigned_tx_hex 的末尾 64 字节后提交；\
+                     交易在 expiration_timestamp_secs 之后失效",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 无私钥转账第二步：广播 agent 签好的交易。
+    ///
+    /// 领域说明：走 `POST /transactions`（`submit_transaction`），
+    /// 节点做完准入校验（签名、序列号、格式）后放进 mempool 就返回。
+    /// **广播成功 ≠ 执行成功**——Move 合约 abort、gas 不足、账户未注册等错误
+    /// 要等落块后才看得到。确认结果请用 `tx(<hash>)` 查询。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        // 归一化：没传 / 空串都折算成缺省的 hex。
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+
+        let raw = match encoding {
+            "hex" => hexutil::decode_hex(&req.signed_tx_hex)?,
+            "base64" => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(req.signed_tx_hex.trim())
+                    .map_err(|e| {
+                        SdkError::invalid_argument(format!("已签名交易不是合法 base64: {e}"))
+                    })?
+            }
+            // 显式拒绝未列出的编码，而不是「默认按 hex 解」——
+            // 后者会把 base64 串当 hex 解出一堆垃圾字节，错误信息将完全误导。
+            other => {
+                return Err(SdkError::invalid_argument(format!(
+                    "APT 已签名交易只接受 hex 或 base64 编码，收到 {other}"
+                )));
+            }
+        };
+        if raw.is_empty() {
+            return Err(SdkError::invalid_argument("已签名交易为空"));
+        }
+
+        let tx_hash = crate::tx::broadcast_raw(&self.rpc_url, &raw).await?;
+
+        Ok(SubmitView::new(ChainKind::Apt, &self.network, tx_hash).with_extra(json!({
+            "broadcast": true,
+            "encoding": encoding,
+            "note": "submit_transaction 不等确认，请用 tx(<hash>) 查询最终执行结果",
+        })))
+    }
+
     /// 转账：本地构造、签名并广播（`dry_run` 为 `true` 时只签名不广播）。
     ///
     /// APT 原生币是 Move 资源，转账走 `0x1::aptos_account::transfer(收款方, 金额)`，
@@ -598,6 +728,22 @@ fn validate_address(raw: &str) -> Result<(), SdkError> {
     Ok(())
 }
 
+/// 解析 32 字节 ed25519 公钥，返回原始字节。
+///
+/// 与地址校验（`validate_address`，允许短地址）不同，这里**严格**要求 32 字节：
+/// 公钥会原样写进 authenticator，长度不对节点直接拒收整笔交易。
+/// 早在这里挡一道，比让 agent 拿着无效外壳去签名再被节点拒绝要好得多。
+fn parse_ed25519_public_key(raw: &str) -> Result<Vec<u8>, SdkError> {
+    let bytes = hexutil::decode_hex(raw)?;
+    if bytes.len() != 32 {
+        return Err(SdkError::invalid_argument(format!(
+            "APT 公钥需为 32 字节 ed25519 公钥（0x + 64 位十六进制），实际 {} 字节",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// 校验交易哈希：`0x` 前缀（可省）+ **恰好** 64 位十六进制。
 ///
 /// 与地址不同，哈希长度是固定的，因此这里用 `!= 64` 严格卡死。
@@ -613,18 +759,6 @@ fn validate_tx_hash(raw: &str) -> Result<(), SdkError> {
         )));
     }
     Ok(())
-}
-
-/// 判断 `raw` 是否形如区块哈希（64 位十六进制）。
-///
-/// 语法说明：返回 `bool` 而非 `Result`——这里只是「看起来像不像」的试探，
-/// 不是校验，判断为 false 还有后续的高度解析路径可以走。
-fn is_block_hash(raw: &str) -> bool {
-    let body = raw
-        .strip_prefix("0x")
-        .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    body.len() == 64 && body.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// `loose_u64` 的 `Option` 适配版，供 `and_then` 链式调用。
@@ -684,7 +818,5 @@ mod tests {
         assert!(validate_address(&"ab".repeat(33)).is_err());
         assert!(validate_tx_hash(&format!("0x{}", "ab".repeat(32))).is_ok());
         assert!(validate_tx_hash("0x123").is_err());
-        assert!(is_block_hash(&format!("0x{}", "ab".repeat(32))));
-        assert!(!is_block_hash("12345"));
     }
 }

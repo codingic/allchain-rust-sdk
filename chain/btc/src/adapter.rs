@@ -33,8 +33,8 @@ use bitcoin::{Address, CompressedPublicKey, Network, PublicKey};
 use serde_json::json;
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, SdkError, StatusView, SubmitRequest, SubmitView, TxStatus, TxView, hexutil,
 };
 
 use crate::backend::Chain;
@@ -103,7 +103,10 @@ impl BtcClient {
     /// 语法说明：这是**关联函数（方法）**，第一个参数是 `&self`；
     /// 它只是转发给同名的自由函数 `fail`，好处是调用处可写 `self.fail(...)`
     /// 而不必关心 `fail` 在模块何处定义。
-    fn fail(&self, context: &str, err: impl std::fmt::Display) -> SdkError {
+    ///
+    /// 约束必须与自由函数**完全一致**（同样是 `Into<anyhow::Error>`），
+    /// 否则转发时会在这一层就把错误降级成 Display，根因照样丢掉。
+    fn fail(&self, context: &str, err: impl Into<anyhow::Error>) -> SdkError {
         fail(context, err)
     }
 }
@@ -131,6 +134,30 @@ fn parse_network(raw: Option<&str>) -> Result<NetworkArg, SdkError> {
     }
 }
 
+/// 解析地址并**校验它属于指定网络**。
+///
+/// 抽出来是因为转账相关的三个入口（`transfer` / `build_transfer`）
+/// 都必须做同一件事：先按 `NetworkUnchecked` 解析字符，再升级成
+/// `NetworkChecked`。漏掉第二步就会出现「把主网地址发到测试网」，
+/// 而这类错误在广播前**不会有任何提示**。
+fn parse_checked_address(
+    raw: &str,
+    network: Network,
+) -> Result<Address<bitcoin::address::NetworkChecked>, SdkError> {
+    raw.trim()
+        // turbofish 语法 `parse::<Address<NetworkUnchecked>>()`：
+        // 在方法名上直接指定泛型参数，让编译器知道要解析成什么类型。
+        .parse::<Address<NetworkUnchecked>>()
+        // 这里丢弃解析器的原始英文错误，改用统一的中文提示，
+        // 避免把库内部信息直接抛给用户。
+        .map_err(|_| SdkError::invalid_argument(format!("非法 BTC 地址: {raw}")))?
+        // **关键一步**：把「未校验网络的地址」升级成「已校验网络的地址」。
+        // 若用户拿主网地址来测试网转账，这里就会报错，
+        // 而不是等到广播时才被节点拒绝（那时钱可能已经打错网络了）。
+        .require_network(network)
+        .map_err(|e| SdkError::invalid_argument(format!("地址网络不匹配: {e}")))
+}
+
 /// 把任意错误附加上中文上下文，再交给 `classify` 归类成 `SdkError`。
 ///
 /// 领域说明：`classify` 会扫描错误文本里的关键词
@@ -138,11 +165,24 @@ fn parse_network(raw: Option<&str>) -> Result<NetworkArg, SdkError> {
 /// 映射成 `ErrorCode::Network` / `Rpc` / `NotFound` 等，
 /// 所以**上下文文案必须保留原始错误**，否则分类会失准。
 ///
-/// 语法说明：`impl std::fmt::Display` 是**参数位置的 impl Trait**：
-/// 泛型 + 静态分发，任何实现了 `Display` 的类型都能传进来，
-/// 比写成 `&dyn Display` 少一次动态分发，也比 `E: Display` 的写法更短。
-fn fail(context: &str, err: impl std::fmt::Display) -> SdkError {
-    allchain_core::error::classify(&format!("{context}: {err}"))
+/// ⚠️ 为什么参数必须是 `Into<anyhow::Error>` 而不是 `impl Display`：
+/// `anyhow::Error` 的普通 `Display` **只打印最外层上下文**，
+/// 真正的根因（网络不通、超时、HTTP 状态码）藏在 `source()` 链里，
+/// 用 `impl Display` 接住就会**静默丢掉整条链**，表现为
+/// 「只看到『查询 UTXO 失败』、看不出是网络还是参数问题」。
+/// 转成 `anyhow::Error` 后用 `{err:#}` 才能把整条链拼进文本。
+///
+/// 语法说明：
+/// - `impl Into<anyhow::Error>` 是**参数位置的 impl Trait**：泛型 + 静态分发。
+///   它同时接受两种实参——`anyhow::Error` 本身（走标准库的反射实现
+///   `impl<T> From<T> for T`），以及任何 `std::error::Error + Send + Sync + 'static`
+///   的具体错误类型（走 `anyhow` 的 `impl<E: Error + Send + Sync + 'static> From<E> for Error`）。
+/// - `{err:#}` 里的 `#` 是**备用（alternate）格式化标志**。anyhow 为 `Display`
+///   实现了两种形态：`{}` 只给最外层，`{:#}` 把整条链用 `": "` 串成一行。
+///   这正是 `classify` 需要的输入形态。
+fn fail(context: &str, err: impl Into<anyhow::Error>) -> SdkError {
+    let err = err.into();
+    allchain_core::error::classify(&format!("{context}: {err:#}"))
 }
 
 // 属性宏必须先于 `impl` 块，它会在**编译前**重写整个块。
@@ -376,66 +416,96 @@ impl ChainClient for BtcClient {
         })))
     }
 
-    /// 构造并（可选）广播一笔转账。私钥只在本地参与签名，不出网。
+    /// **无私钥**构造转账：拉 UTXO → 选币 → 搭模板 → 逐输入算 sighash → 交回调用方。
     ///
-    /// 语法说明：`req: TransferRequest` 是**按值**接收的。
-    /// 契约层这样设计是为了让实现者可以自由决定：
-    /// 直接消费字段（如末尾的 `req.to`），还是只借用。
-    async fn transfer(&self, req: TransferRequest) -> Result<TransferView, SdkError> {
-        // `self.chain.network()` 是 CLI 层的 `NetworkArg`，
-        // 再 `.network()` 得到 rust-bitcoin 的 `Network`——两层同名方法的典型"拆解"。
+    /// BTC 只提供**两段式**：本方法是第一段，SDK 只负责构造，
+    /// 签名交给调用方（agent）用自己的私钥做，私钥从不进入本进程。
+    ///
+    /// 为什么没有一体式 `transfer`：它要求把私钥传进 SDK，
+    /// 而一旦 SDK 也能签名，就存在两套独立的签名实现——两处对 sighash 的理解
+    /// 一旦漂移，只会在广播时被节点拒绝，本地不报任何错。
+    /// ⚠️ **BTC 与其它链最大的不同：待签对象有多个。**
+    /// UTXO 模型下每个输入各有一个 sighash，N 个输入就是 N 个签名。
+    /// `signing_payload_hex` 只装得下第一个（保持契约字段不空），
+    /// 完整列表在 `extra.signing_payloads` 里，**签名顺序必须与它一致**。
+    ///
+    /// 领域说明——为什么 BTC **必须**给 `public_key`：
+    /// P2WPKH 的见证里要显式放公钥（BTC 不用可恢复签名），
+    /// 而公钥无法从地址反推（地址是公钥的哈希）。
+    /// 这与 ETH 不同——ETH 的签名带 recovery id，节点能自己恢复出公钥。
+    async fn build_transfer(&self, req: BuildTransferRequest) -> Result<BuildTransferView, SdkError> {
         let network = self.chain.network().network();
-        let to = req
-            .to
-            .trim()
-            // turbofish 语法 `parse::<Address<NetworkUnchecked>>()`：
-            // 在方法名上直接指定泛型参数，让编译器知道要解析成什么类型。
-            .parse::<Address<NetworkUnchecked>>()
-            // 这里丢弃了解析器的原始错误（`|e|` 都省了），
-            // 改用统一的中文提示，避免把库内部的英文错误直接抛给用户。
-            .map_err(|_| SdkError::invalid_argument(format!("非法 BTC 地址: {}", req.to)))?
-            // **关键一步**：把「未校验网络的地址」升级成「已校验网络的地址」。
-            // 若用户拿主网地址来测试网转账，这里就会报错，
-            // 而不是等到广播时才被节点拒绝（那时钱可能已经打错网络了）。
-            .require_network(network)
-            .map_err(|e| SdkError::invalid_argument(format!("地址网络不匹配: {e}")))?;
-
-        // 金额统一解析成 **satoshi**（1 BTC = 1e8 sat）。
-        // 统一模型里 `amount` 是字符串，接受 "0.001" / "0.001btc" / "100000sat" 等多种写法。
+        let to = parse_checked_address(&req.to, network)?;
+        // 金额统一解析成 satoshi（1 BTC = 1e8 sat）。
         let amount_sat = crate::units::parse_amount(&req.amount)
             .map_err(|e| SdkError::invalid_argument(format!("非法金额: {e}")))?;
 
-        // 走单链 CLI 同一套构造逻辑：选币 → 估费 → 本地签名。
-        // 三个尾参依次是：费率（None = 向数据源问推荐值）、
-        // legacy（false = 只花 P2WPKH 地址上的币）、rbf（false = 不可替换）。
-        // 统一接口刻意不暴露这些细节，避免上层被链特有概念污染。
-        let built = crate::transactions::build_transfer(
+        // BTC 一定要公钥：见证/scriptSig 里要放它，且地址由它派生。
+        let public_key = req.public_key.as_deref().ok_or_else(|| {
+            SdkError::invalid_argument(
+                "BTC 的 build_transfer 必须提供 public_key（33 字节压缩公钥的十六进制）：\
+                 P2WPKH 的见证需要显式携带公钥，而公钥无法从地址反推",
+            )
+        })?;
+        let public_key = crate::tx::parse_public_key(public_key)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 BTC 公钥: {e}")))?;
+
+        // 校验 `from` 与公钥派生出的地址一致。
+        //
+        // 这条校验是**有意义的**：无私钥就无法证明调用方拥有该地址，
+        // 但「给的地址和给的公钥对不上」是能立刻发现的输入错误。
+        // 两者不匹配时通常是用错了钱包（同一助记词下的另一个账户）。
+        let addresses = crate::tx::key_addresses(&public_key, network);
+        let expected = [addresses.p2wpkh.to_string(), addresses.p2pkh.to_string()];
+        if !expected.iter().any(|a| a == req.from.trim()) {
+            return Err(SdkError::invalid_argument(format!(
+                "from({}) 与该公钥派生的地址都不匹配（p2wpkh={}，p2pkh={}）",
+                req.from, addresses.p2wpkh, addresses.p2pkh
+            )));
+        }
+
+        // 费率向数据源要推荐值；未取到时后台内部会退回缺省常量。
+        let fee_rate = crate::tx::current_fee_rate(&self.chain).await;
+        let built = crate::tx::assemble_unsigned(
             &self.chain,
-            &req.private_key,
-            &to,
-            amount_sat,
-            None,
-            false,
-            false,
+            &public_key,
+            &crate::tx::UnsignedRequest {
+                public_key,
+                to,
+                amount_sat,
+                fee_rate,
+                // 两段式默认开启 RBF：构造与广播之间可能隔很久，
+                // 费率行情会变，留一条「加价替换」的后路比不可替换更安全。
+                rbf: true,
+            },
         )
         .await
-        .map_err(|e| self.fail("构造签名转账失败", e))?;
+        .map_err(|e| self.fail("构造未签名转账失败", e))?;
 
-        // dry-run 时不广播，直接返回本地算出的 txid。
-        //
-        // 语法说明：`if / else` 在 Rust 里是**表达式**，
-        // 所以能直接把结果赋给 `txid`；两个分支类型必须相同（都是 `String`）。
-        let txid = if req.dry_run {
-            // `.clone()`：`built.txid` 后面还要在 `Ok(...)` 里再次用到？
-            // 实际没有，但这里保留克隆以免与广播分支的所有权形态不一致。
-            built.txid.clone()
-        } else {
-            // 广播是唯一的**不可逆**操作：进入网络后无法撤回。
-            self.chain
-                .broadcast(&built.raw_hex)
-                .await
-                .map_err(|e| self.fail("广播交易失败", e))?
-        };
+        // 待签对象数组：顺序即签名的顺序。
+        let payloads: Vec<_> = built
+            .signing_payloads
+            .iter()
+            .map(|p| {
+                json!({
+                    "index": p.index,
+                    "txid": p.txid,
+                    "vout": p.vout,
+                    "value_sat": p.value,
+                    "script_type": p.script_type,
+                    // 带 0x 前缀，`signing_payload_hex` 同款格式。
+                    "sighash": format!("0x{}", p.sighash),
+                })
+            })
+            .collect();
+        let signature_count = payloads.len();
+        // `signing_payload_hex` 是契约里的单值字段，装不下 N 个哈希。
+        // 取第 0 个填入以保证字段非空可签，完整列表请看 `extra.signing_payloads`。
+        let first_payload = built
+            .signing_payloads
+            .first()
+            .map(|p| format!("0x{}", p.sighash))
+            .unwrap_or_default();
 
         let inputs: Vec<_> = built
             .inputs
@@ -444,37 +514,134 @@ impl ChainClient for BtcClient {
                 json!({
                     "txid": i.txid,
                     "vout": i.vout,
-                    "value": i.value,
+                    "value_sat": i.value,
                     "confirmed": i.confirmed,
                 })
             })
             .collect();
 
-        Ok(TransferView::new(
+        Ok(BuildTransferView::new(
             ChainKind::Btc,
             &self.network,
-            // `Some(built.from.clone())`：付款方地址由**私钥派生**得到，
-            // 所以一定存在；但统一模型里它是 `Option<String>`，
-            // 因为有些链（如某些合约调用）没有明确的单一付款账户。
-            Some(built.from.clone()),
-            // `req.to` 在这里被**移动**进构造器——原样回显用户输入，便于对账。
+            req.from,
             req.to,
-            amount_sat as u128,
-            Some(txid),
-            // 第五个参数是"是否已广播"，正好是 `dry_run` 的反义。
-            !req.dry_run,
+            built.amount_sat as u128,
+            built.unsigned_tx_hex,
+            first_payload,
+            // 签名曲线。
+            "secp256k1",
+            // payload **已经是**最终摘要（双 SHA256 的结果），不要再哈希。
+            "none",
         )
         .with_extra(json!({
-            // 手续费用 sat 计（BTC 的"最小可分割单位"），
-            // 不用 BTC 小数，避免浮点精度问题。
+            // —— 这里是真正要用的待签清单 ——
+            "signing_payloads": payloads,
+            "signature_count": signature_count,
+            // 签名格式：**64 字节紧凑格式**（r||s）的十六进制，不是 DER。
+            "signature_encoding": "compact-rs-hex",
+            // payload 是怎么算出来的（信息性字段）。
+            "sighash_algorithm": "sha256d",
+            "sighash_type": "SIGHASH_ALL",
+            // —— 广播阶段要原样回传 ——
+            "submit_context": built.context,
+            "public_key": hexutil::encode_hex(&public_key.to_bytes()),
+            // —— 费用与找零 ——
             "fee_sat": built.fee,
             "fee_rate_sat_vb": built.fee_rate,
-            "vsize": built.vsize,
-            // 找零：0 表示剩余金额低于 dust 阈值，已并入手续费。
+            "vsize_estimate": built.vsize_estimate,
             "change_sat": built.change,
+            "change_address": built.change_address,
+            "rbf": true,
             "inputs": inputs,
-            // raw_tx 让调用方可以自行广播或离线存档。
-            "raw_tx": built.raw_hex,
+            // —— 调用方指引 ——
+            "splice": "not_byte_splicable__pass_signatures_and_submit_context_to_submit_tx",
+            "note": "BTC 每个输入各有一个 sighash：请按 signing_payloads 的顺序逐个用 secp256k1 \
+                     签出 64 字节（r||s）签名，放进 SubmitRequest.signatures 数组，\
+                     并把本响应里的 submit_context 放进 SubmitRequest.context，再调用 submit_tx。\
+                     signed_tx_hex 在 BTC 上不使用（留空即可）。",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易。BTC 收的是**签名数组 + 上下文**，不是拼好的交易字节。
+    ///
+    /// 领域说明——为什么不能像 ETH 那样直接收一段字节：
+    /// 让 agent 自己拼 BTC 交易，要同时搞对 DER 编码、低 S 归一化、
+    /// 见证与 scriptSig 的结构差异。任一处出错，产出的是
+    /// **格式合法但语义错误**的交易：本地一切正常，广播才被节点拒。
+    /// 所以这里只收签名，由 SDK 重组，并在广播前**逐个验签**。
+    ///
+    /// 参数约定：
+    /// - `signatures`：**按 `signing_payloads` 顺序**排列的 64 字节紧凑签名（十六进制）；
+    /// - `context`：`build_transfer` 下发的 `extra.submit_context`，原样回传；
+    /// - `signed_tx_hex`：BTC **不使用**（设为 `""` 即可）——最终交易由 SDK 组装。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+        if encoding != "hex" {
+            return Err(SdkError::invalid_argument(format!(
+                "BTC 签名只接受 hex 编码，收到 {encoding}"
+            )));
+        }
+
+        let context_value = req.context.ok_or_else(|| {
+            SdkError::invalid_argument(
+                "BTC 广播必须回传 build_transfer 下发的 extra.submit_context：\
+                 交易的输入金额与脚本类型不在交易字节里，缺了它无法重算 sighash",
+            )
+        })?;
+        let context: crate::tx::SubmitContext = serde_json::from_value(context_value)
+            .map_err(|e| SdkError::invalid_argument(format!("submit_context 解析失败: {e}")))?;
+
+        // 跨网护栏：拿主网构造的上下文去测试网广播，地址编码不同，
+        // 广播出去的钱会打到另一个网络上——这一步必须在**广播前**拦住。
+        if context.network != self.network {
+            return Err(SdkError::invalid_argument(format!(
+                "网络不匹配：该上下文是在 {} 构造的，当前客户端是 {}",
+                context.network, self.network
+            )));
+        }
+
+        let raw_signatures = req.signatures.ok_or_else(|| {
+            SdkError::invalid_argument(
+                "BTC 广播需要 signatures 数组：每个输入一个 64 字节紧凑签名，\
+                 顺序与 build_transfer 下发的 signing_payloads 一致",
+            )
+        })?;
+        let signatures = raw_signatures
+            .iter()
+            // 闭包而非直接传函数指针：`decode_hex` 收 `&str`，
+            // 而 `iter()` 给的是 `&String`，需要一次解引用强制转换。
+            .map(|s| hexutil::decode_hex(s))
+            .collect::<Result<Vec<_>, SdkError>>()
+            .map_err(|e| SdkError::invalid_argument(format!("签名不是合法十六进制: {e}")))?;
+
+        // 重组（内部会重建交易 + 逐个验签 + 上下文自检）。
+        let signed = crate::tx::assemble_signed(&context, &signatures)
+            .map_err(|e| SdkError::invalid_argument(format!("组装已签名交易失败: {e}")))?;
+        let (raw_hex, txid) = crate::tx::finalize(&signed);
+
+        // 广播是唯一**不可逆**的操作，前面所有校验都是为了走到这里时已万无一失。
+        let broadcast_txid = self
+            .chain
+            .broadcast(&raw_hex)
+            .await
+            .map_err(|e| self.fail("广播交易失败", e))?;
+
+        Ok(SubmitView::new(ChainKind::Btc, &self.network, txid.clone()).with_extra(json!({
+            "broadcast": true,
+            // 节点返回的 txid 应与本地算出的一致；不一致说明数据源做了非预期处理。
+            "node_txid": broadcast_txid,
+            "txid_matches_local": broadcast_txid == txid,
+            "input_count": context.inputs.len(),
+            "signature_count": signatures.len(),
+            // 实测体积（签名后），可用于回核对账。
+            "vsize": signed.vsize(),
+            "raw_tx": raw_hex,
         })))
     }
 
@@ -619,5 +786,67 @@ mod tests {
         assert!(derive(UNCOMPRESSED, Network::Bitcoin).is_err());
         // 长度不足（3 字节）的乱码：`PublicKey::from_slice` 直接失败。
         assert!(derive("02abcd", Network::Bitcoin).is_err());
+    }
+
+    /// 回归测试：`fail` 必须保留 anyhow 的**整条错误链**，而不只是最外层上下文。
+    ///
+    /// 领域说明：BTC 适配器普遍用 `anyhow::Context` 给底层 IO 错误套中文上下文
+    ///（形如「查询 xx 地址的 UTXO 失败」）。但 `anyhow::Error` 的 `Display` 实现
+    /// **只打印最外层那一句**，真正有价值的根因（"connection refused"、
+    /// "timed out"、HTTP 状态码）藏在 `source()` 链里。
+    /// 旧实现 `format!("{context}: {err}")` 恰好只触发 `Display`，于是根因被丢掉：
+    /// 运维只看到「查询 UTXO 失败」，看不出是网络不通还是参数错。
+    /// 更隐蔽的危害是——`classify` 靠关键词分类，根因丢失会让它把
+    /// 网络故障误判成兜底的 `RpcError`，调用方的重试策略随之失真。
+    ///
+    /// 语法说明：
+    /// - `anyhow::Context` trait 给 `Result` 和 `Option` 都做了实现，
+    ///   所以要先造一个 `Result` 才能链式调用 `.context(..)`；
+    ///   这里用 `Err::<(), _>(root)` 的** turbofish **指定 Ok 类型是 `()`。
+    /// - `unwrap_err()` 在 `Result` 上取出 `E`；因为 `T = ()` 无意义，语义上正好。
+    #[test]
+    fn fail_keeps_the_root_cause_of_a_nested_anyhow_error() {
+        use allchain_core::ErrorCode;
+        use anyhow::Context;
+
+        // 造一条「两层」错误：外层中文上下文 + 内层英文根因，复刻真实调用形态。
+        let root = anyhow::anyhow!("connection refused (os error 61)");
+        let err = Err::<(), _>(root)
+            .context("查询 xxx 地址的 UTXO 失败")
+            .unwrap_err();
+
+        let sdk = fail("查询地址失败", err);
+
+        // 上下文要保留，否则日志失去可读性。
+        assert!(
+            sdk.message.contains("查询地址失败"),
+            "外层上下文丢了: {}",
+            sdk.message
+        );
+        assert!(
+            sdk.message.contains("查询 xxx 地址的 UTXO 失败"),
+            "内层上下文丢了: {}",
+            sdk.message
+        );
+        // 最关键的一条：根因必须透出。
+        assert!(
+            sdk.message.contains("connection refused"),
+            "根因被丢掉了: {sdk:?}"
+        );
+        // 根因关键词必须能驱动分类——这里应判为网络错误，而不是兜底的 RpcError。
+        assert_eq!(sdk.code, ErrorCode::NetworkError, "message = {}", sdk.message);
+    }
+
+    /// 上一条测试的**反证**：若 `classify` 只看得到外层中文上下文，
+    /// 它落到的错误码必然不是 `NetworkError`。
+    ///
+    /// 没有这条断言，上一条测试可能因为「classify 恰好兜底成 RpcError 也说得通」
+    /// 而变成一个恒真断言——反证用来确认「根因确实参与了分类」。
+    #[test]
+    fn classifying_only_the_outer_context_would_misjudge_the_code() {
+        use allchain_core::ErrorCode;
+
+        let only_outer = allchain_core::error::classify("查询地址失败: 查询 UTXO 失败");
+        assert_ne!(only_outer.code, ErrorCode::NetworkError);
     }
 }

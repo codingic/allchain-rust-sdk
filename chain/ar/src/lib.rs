@@ -8,13 +8,23 @@
 //! - 官方不提供 JSON-RPC，只有一组 REST 端点（`/info`、`/tx/{id}`、`/wallet/{addr}/balance`），
 //!   以及可选的 GraphQL 网关（本 crate 只用 REST）。
 //!
-//! 关于依赖：`Cargo.toml` 里列了 `arweave-rs`，但本 crate 并未调用它——
-//! 请求统一走 `chain_rpcutil::Http`。理由与 apt / ckb 一致：只需要四个只读端点，
-//! 不值得为此拖入一整棵依赖树（那会引入 RSA、GraphQL 客户端等重量级依赖）。
+//! 关于依赖：`arweave-rs` 只在**写路径**上被调用——交易的 deep hash 与
+//! RSA-PSS 签名原语由它提供（`adapter::transfer` 与 `tx` 模块）；
+//! 读路径（`/info`、`/tx/{id}`、余额…）一律走 `chain_rpcutil::Http`，
+//! 因为只需要几个 REST 端点，不值得为它们再引一条依赖链。
 //!
-//! 明确的能力边界：本 crate **只提供只读查询与本地公钥派生地址**，不支持转账。
-//! Arweave 的转账要用 RSA-PSS 对交易的完整字段签名并做 chunk 上传，
-//! 属于写路径，当前未实现；`ChainClient::transfer` 走 trait 默认分支返回 `UNSUPPORTED`。
+//! 能力边界：
+//! - 读路径全部支持；
+//! - 写路径有**两条**：
+//!   - `ChainClient::transfer` 是**一体式**——私钥（JWK）进 SDK，签名与广播都在内部完成；
+//!   - `ChainClient::build_transfer` + `ChainClient::submit_tx` 是**两段式**——
+//!     SDK 只负责构造与广播，签名由调用方（agent）用自己的私钥完成，
+//!     私钥**从不进入本进程**。纯计算部分在 [`tx`] 模块。
+//!
+//! 两段式在 AR 上有一个其它链没有的硬约束：交易的 `owner` 字段要写 RSA 模数 n，
+//! 而地址是 `sha256(n)` 的哈希——**单向不可逆**，无法从地址反推模数，
+//! 因此 `BuildTransferRequest::public_key` 在 AR 上是**必填**的。
 
 pub mod adapter;
 pub mod network;
+pub mod tx;

@@ -196,6 +196,49 @@ enum Command {
         #[arg(long)]
         from: Option<String>,
     },
+    /// 无私钥构造转账：返回未签名交易与待签对象（两段式第一阶段）
+    ///
+    /// 与 `transfer` 的关键差别：**没有 `--private-key` 参数**。
+    /// 私钥留在 agent 手里，本命令只查链上状态并组装待签材料。
+    #[command(name = "build-transfer", alias = "buildtransfer")]
+    BuildTransfer {
+        #[command(flatten)]
+        chain: ChainArgs,
+        /// 付款地址 / 账户；**必填**，因为没有私钥可供推导地址
+        #[arg(long)]
+        from: String,
+        /// 收款地址
+        #[arg(long)]
+        to: String,
+        /// 金额，原生单位（如 0.01）
+        #[arg(long)]
+        amount: String,
+        /// 签名公钥；NEAR / APT 等「账户与密钥解耦」的链需要，AR 必填（RSA 模数 base64url）
+        #[arg(long)]
+        public_key: Option<String>,
+    },
+    /// 广播已签名交易（两段式第二阶段）
+    ///
+    /// 只接收签完名的交易字节，全程不接触私钥。
+    #[command(name = "submit-tx", alias = "submittx")]
+    SubmitTx {
+        #[command(flatten)]
+        chain: ChainArgs,
+        /// 已签名交易的十六进制（`--encoding base64` 时为 base64 串）
+        #[arg(long)]
+        signed_tx_hex: String,
+        /// 编码：hex（默认，不传即 hex）或 base64
+        #[arg(long)]
+        encoding: Option<String>,
+        /// 构造阶段下发的上下文 JSON 字符串，原样回传（TON 的 cell 树需要）
+        #[arg(long)]
+        context: Option<String>,
+        /// 签名列表，逗号分隔；顺序须与构造阶段下发的待签对象一致（BTC 多输入场景）
+        // `value_delimiter = ','` 让 `--signatures a,b,c` 与
+        // `--signatures a --signatures b` 两种写法都能解析成 `Vec<String>`。
+        #[arg(long, value_delimiter = ',')]
+        signatures: Option<Vec<String>>,
+    },
     /// 列出支持的链、精度与能力
     // `chains` 不接受 `ChainArgs`：它是「查 SDK 自身的能力」而不是「查某条链」，
     // 加 `--chain` 反而误导。只保留 `--format`。
@@ -273,6 +316,64 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .await
+        }
+
+        // 两段式第一阶段：参数直接透传，没有私钥解析这一步。
+        Command::BuildTransfer {
+            chain,
+            from,
+            to,
+            amount,
+            public_key,
+        } => {
+            run(
+                chain,
+                Action::BuildTransfer {
+                    from,
+                    to,
+                    amount,
+                    public_key,
+                },
+            )
+            .await
+        }
+
+        // 两段式第二阶段。`--context` 是 JSON **字符串**，先解析成 `Value`：
+        // 解析失败时连 `run()` 都不必进——此时构造不出合法的 Action，
+        // 与 `run()` 里「链标识解析失败」同属**参数级**错误，直接报错并返回退出码 1。
+        Command::SubmitTx {
+            chain,
+            signed_tx_hex,
+            encoding,
+            context,
+            signatures,
+        } => {
+            // 语法说明：`Option::as_deref` 把 `Option<String>` 借成 `Option<&str>`，
+            // 于是 `map(serde_json::from_str::<Value>)` 只在 `Some` 时解析、`None` 时原样透传；
+            // 末尾的 `.transpose()` 把 `Option<Result<Value, E>>` 翻转成 `Result<Option<Value>, E>`，
+            // 这样才能用一个 `match` 同时处理「没传」与「传了且解析成功」。
+            match context
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+            {
+                Ok(context) => {
+                    run(
+                        chain,
+                        Action::SubmitTx {
+                            signed_tx_hex,
+                            encoding,
+                            context,
+                            signatures,
+                        },
+                    )
+                    .await
+                }
+                Err(e) => {
+                    eprintln!("--context 必须是合法 JSON（原样复制 build-transfer 返回的 extra.submit_context）: {e}");
+                    1
+                }
+            }
         }
 
         Command::Chains { format } => {

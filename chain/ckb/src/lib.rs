@@ -13,16 +13,26 @@
 //! （blake160 + bech32/bech32m，约 300 行）。理由：官方 SDK 会拖入 ckb-types、molecule、
 //! secp256k1 等一整棵依赖树，而我们只需要四个只读接口 + 地址编解码。
 //!
-//! 不过 `ckb-sdk` 被留在 `[dev-dependencies]` 里，是**有意**的：
-//! 它只用于 `tests/official_sdk_crosscheck.rs`，充当地址编码的「标准答案」。
-//! 手写编解码最大的风险是「自往返通过、但与链上不一致」——
-//! bech32 与 bech32m 只差一个常量，编错了自己解码自己永远是对的，
-//! 只有跟官方实现对拍才暴露得出来。
+//! 关于依赖：`Cargo.toml` 里列了 `ckb-sdk`（重命名为 `official-ckb-sdk` 以避开本
+//! crate 的 `[lib] name = "ckb_sdk"` 撞名）。它现在**同时**用于两处：
+//! - 地址编解码的对拍（`tests/official_sdk_crosscheck.rs`）。
+//!   手写编解码最大的风险是「自往返通过、但与链上不一致」——
+//!   bech32 与 bech32m 只差一个常量，编错了自己解码自己永远是对的，
+//!   只有跟官方实现对拍才暴露得出来。
+//! - 转账路径（`adapter.rs` + `tx.rs`）：cell 收集、容量平衡、witness 签名摘要。
+//!   这些逻辑踩错一字节就会产出「能广播、但节点永远拒收」的交易，
+//!   手写不划算。其中「待签摘要」直接调用官方 `unlock::generate_message`，
+//!   本 crate 不复刻哈希拼接。
 //!
-//! 明确的能力边界：本 crate **只提供只读查询与本地公钥派生地址**，不支持转账。
-//! CKB 转账要收集 live cell、构造 CellDeps、算手续费并签名 witness，
-//! 属于写路径，当前未实现；`ChainClient::transfer` 走 trait 默认分支返回 `UNSUPPORTED`。
+//! 转账有两条路径：
+//! - 一体式 `transfer`：私钥进 SDK，包办构造 + 签名 + 广播；
+//! - 两段式 `build_transfer` / `submit_tx`：**私钥不进 SDK**，
+//!   SDK 只负责构造与广播，签名留给调用方（agent）。
+//!
+//! 两条路径共用 `tx` 模块里的纯函数与同一批官方组件，
+//! 因此产出的交易字节完全一致（`tx.rs` 里有逐字节对拍测试）。
 
 pub mod adapter;
 pub mod address;
 pub mod network;
+pub mod tx;

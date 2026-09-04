@@ -21,3 +21,9 @@ tonlib-core = "0.26"
 # TON 内部转账消息的金额字段是 `num_bigint::BigUint`（tonlib-core 的公开类型），
 # 构造 `InternalMessage` 时必须显式引入，否则即便它是传递依赖也无法在源码里引用。
 num-bigint = "0.4"
+hex = { workspace = true }
+base64 = { workspace = true }
+# TON 的签名不在 BOC 末尾、也不字节对齐，无法「覆盖 N 个字节」拼装，
+# 因此广播阶段由 SDK 重组消息——重组后必须**先验签再广播**，
+# 于是 ed25519 验签是运行期依赖，不只是测试依赖。
+ed25519-dalek = "2.2"

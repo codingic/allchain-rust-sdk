@@ -52,8 +52,9 @@ use solana_transaction_status_client_types::{
 };
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest,
+    TransferView, TxStatus, TxView, hexutil,
 };
 
 use crate::cluster::{self, ClusterArg};
@@ -494,6 +495,117 @@ impl ChainClient for SolClient {
         )
         // blockhash 回显出来，便于调用方核对交易锚定的区块（排查交易过期问题时很有用）。
         .with_extra(json!({ "recent_blockhash": blockhash })))
+    }
+
+    /// **无私钥**构造转账：取最新 blockhash、组装 SystemProgram.transfer，产出待签消息。
+    ///
+    /// 与 [`ChainClient::transfer`] 的分工：`transfer` 是**一段式**（私钥进 SDK，
+    /// 签名广播都在 SDK 内）；本方法是**两段式**的第一段——只组装，
+    /// 签名交给调用方（agent）用自己的私钥做，私钥从不进入本进程。
+    ///
+    /// 调用方拿到结果后应：
+    ///   1. 对 `signing_payload_hex` 做 ed25519 签名（Solana 不做二次哈希，直接签这串字节）；
+    ///   2. 把签名填回 `unsigned_tx_hex` 里的 `signatures[0]`，得到可广播交易；
+    ///   3. 交给 [`Self::submit_tx`] 广播。
+    ///
+    /// 领域说明：blockhash 有**有效期**（约 150 个块，主网约 1 分钟）。
+    /// 因此构造与广播之间不能拖太久，否则交易会被节点以 `BlockhashNotFound` 拒绝。
+    /// 这与 ETH 那种「签完可以慢慢发」的模型截然不同，是本链独有的时间约束。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        // 两个地址与金额都是**纯本地**解析，失败即为参数错误，
+        // 不必联网——让错误尽早、便宜地暴露。
+        let from: Pubkey = req
+            .from
+            .trim()
+            .parse()
+            .map_err(|_| SdkError::invalid_argument(format!("非法 SOL 付款地址: {}", req.from)))?;
+        let to: Pubkey = req
+            .to
+            .trim()
+            .parse()
+            .map_err(|_| SdkError::invalid_argument(format!("非法 SOL 收款地址: {}", req.to)))?;
+        let lamports = crate::units::parse_sol(&req.amount)
+            .map_err(|e| SdkError::invalid_argument(format!("非法金额: {e}")))?;
+
+        // 取 blockhash 需要同步 RPC，故整个构造过程放进阻塞线程池。
+        let unsigned = self
+            .blocking("构造未签名转账", move |client| {
+                crate::tx::build_unsigned_transfer(&client, &from, &to, lamports)
+            })
+            .await?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Sol,
+            &self.network,
+            req.from,
+            req.to,
+            lamports as u128,
+            unsigned.unsigned_tx_hex,
+            unsigned.signing_payload_hex,
+            "ed25519",
+            // Solana 不做二次哈希：ed25519 直接对消息字节签名
+            // （SHA-512 摘要在 ed25519 算法内部完成），故这里记为 `none`。
+            "none",
+        )
+        .with_extra(json!({
+            "recent_blockhash": unsigned.recent_blockhash,
+            "lamports": unsigned.lamports,
+            // 提示 blockhash 的时效性约束，避免调用方把待签交易存起来过夜再签。
+            "note": "blockhash 约 150 个块后过期，请在 1 分钟内签名并广播",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易，返回签名（Solana 里签名即 txid）。
+    ///
+    /// 领域说明：只做 `send_transaction`，**不等待确认**。
+    /// 广播成功 ≠ 落块——交易可能因 blockhash 过期、余额不足或程序错误被丢弃，
+    /// 要确认结果请用 [`ChainClient::tx`] 查签名状态。
+    ///
+    /// 编码说明：`encoding` 支持 `base64`（生态惯例，各钱包适配器均如此）
+    /// 与 `hex`，缺省按 `base64` 处理——因为上游签名服务（`../sign`）返回的就是 base64。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        // 归一化：没传 / 空串都折算成缺省的 base64。
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("base64");
+
+        let raw = match encoding {
+            "hex" => hexutil::decode_hex(&req.signed_tx_hex)?,
+            "base64" => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(req.signed_tx_hex.trim())
+                    .map_err(|e| {
+                        SdkError::invalid_argument(format!("已签名交易不是合法 base64: {e}"))
+                    })?
+            }
+            other => {
+                return Err(SdkError::invalid_argument(format!(
+                    "SOL 已签名交易只接受 base64 或 hex 编码，收到 {other}"
+                )))
+            }
+        };
+        if raw.is_empty() {
+            return Err(SdkError::invalid_argument("已签名交易为空"));
+        }
+
+        let signature = self
+            .blocking("广播已签名交易", move |client| {
+                crate::tx::broadcast_raw(&client, &raw)
+            })
+            .await?;
+
+        Ok(SubmitView::new(ChainKind::Sol, &self.network, signature.to_string()).with_extra(json!({
+            "broadcast": true,
+            "encoding": encoding,
+        })))
     }
 
     async fn address_from_pubkey(&self, pubkey: &str) -> Result<AddressView, SdkError> {

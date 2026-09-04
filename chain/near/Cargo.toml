@@ -13,6 +13,9 @@ allchain-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
 bs58 = "0.5"
+# 广播接口接受 base64 编码的已签名交易——NEAR 生态（near-cli、钱包适配器）
+# 交换交易字节时用的都是 base64，不接受它就得让调用方自己转一道。
+base64 = { workspace = true }
 clap = { workspace = true }
 hex = "0.4.3"
 serde = { workspace = true }
@@ -22,3 +25,13 @@ near-crypto = { version = "0.37", features = ["rand"] }
 near-jsonrpc-client = "0.22"
 near-jsonrpc-primitives = "0.37"
 near-primitives = "0.37"
+# 无私钥构造流程要把未签名交易序列化给 agent，用的正是链上的 borsh 编码。
+# 版本必须与 near-primitives 内部用的 borsh 对齐（当前锁在 1.8.1），
+# 否则 `borsh::to_vec(&Transaction)` 与官方序列化出的字节会不一致——
+# 那种偏差不会报错，只会让交易上链时被拒。
+borsh = "1.8"
+
+[dev-dependencies]
+# 仅测试用：独立算一遍 sha256，与 NEAR 官方 `get_hash_and_size()` 的结果对拍。
+# 放在 dev-dependencies 里，生产构建不会把它编进去。
+sha2 = { workspace = true }

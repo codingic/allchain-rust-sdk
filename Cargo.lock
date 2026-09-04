@@ -1036,7 +1036,9 @@ dependencies = [
  "anyhow",
  "aptos-sdk",
  "async-trait",
+ "base64 0.22.1",
  "chain-rpcutil",
+ "hex",
  "serde",
  "serde_json",
  "sha3 0.10.9",
@@ -1094,7 +1096,9 @@ dependencies = [
  "base64 0.22.1",
  "chain-rpcutil",
  "jsonwebkey",
+ "rand_core 0.6.4",
  "reqwest 0.11.27",
+ "rsa",
  "serde",
  "serde_json",
  "sha2",
@@ -5881,6 +5885,8 @@ dependencies = [
  "allchain-core",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "borsh 1.8.1",
  "bs58 0.5.1",
  "clap",
  "hex",
@@ -5890,6 +5896,7 @@ dependencies = [
  "near-primitives",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -8091,42 +8098,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sign"
-version = "0.1.0"
-dependencies = [
- "allchain-core",
- "alloy",
- "anyhow",
- "aptos-sdk",
- "axum",
- "base64 0.22.1",
- "bcs",
- "bincode",
- "blake2",
- "borsh 1.8.1",
- "clap",
- "ed25519-dalek",
- "hex",
- "k256",
- "near-crypto",
- "near-primitives",
- "num-bigint 0.4.8",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "sha3 0.10.9",
- "solana-keypair",
- "solana-message",
- "solana-pubkey 4.2.1",
- "solana-signature",
- "solana-signer",
- "solana-transaction",
- "sui-sdk-types",
- "tokio",
- "tonlib-core",
-]
-
-[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8248,7 +8219,10 @@ dependencies = [
  "allchain-core",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "bincode",
  "clap",
+ "hex",
  "serde",
  "serde_json",
  "solana-commitment-config",
@@ -9772,6 +9746,7 @@ dependencies = [
  "blake2",
  "chain-rpcutil",
  "ed25519-dalek",
+ "hex",
  "serde",
  "serde_json",
  "sui-graphql-client",
@@ -10219,7 +10194,10 @@ dependencies = [
  "allchain-core",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chain-rpcutil",
+ "ed25519-dalek",
+ "hex",
  "num-bigint 0.4.8",
  "serde",
  "serde_json",

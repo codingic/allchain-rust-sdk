@@ -38,8 +38,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest, TransferView,
+    TxStatus, TxView, hexutil,
 };
 
 use crate::network::{self, NetworkArg};
@@ -108,7 +109,10 @@ impl EthClient {
     /// 这是**方法**版本，只是在 trait 实现里少写几个字的便捷转发，
     /// 真正的逻辑在同名的自由函数里。它接收 `&self` 却没用到任何字段——
     /// 这样设计是为了让调用点统一写成 `self.fail(..)`，读起来更顺。
-    fn fail(&self, context: &str, err: impl std::fmt::Display) -> SdkError {
+    ///
+    /// 约束必须与自由函数保持一致（`Into<anyhow::Error>` 而非 `Display`）：
+    /// 若在这一层退化成 `Display`，anyhow 的 source 链会在转发前就被截断。
+    fn fail(&self, context: &str, err: impl Into<anyhow::Error>) -> SdkError {
         fail(context, err)
     }
 }
@@ -130,15 +134,22 @@ fn parse_network(raw: Option<&str>) -> Result<NetworkArg, SdkError> {
 
 /// 错误翻译的唯一入口：`上下文 + 底层错误` → `SdkError`。
 ///
-/// 语法说明：参数 `impl std::fmt::Display` 是 **`impl Trait` 参数位置**
-/// （泛型参数的语法糖）：任何实现了 `Display` 的类型都能传进来
-/// （alloy 的 `RpcError`、anyhow 的 `Error` 都行），
-/// 与写成 `<E: Display>` 等价，但省掉一个泛型参数名。
+/// 语法说明：参数 `impl Into<anyhow::Error>` 是 **`impl Trait` 参数位置**
+/// （泛型参数的语法糖），它同时接受两类实参：
+///   - `anyhow::Error` 本身（走标准库的反射实现 `impl<T> From<T> for T`）；
+///   - 任何 `std::error::Error + Send + Sync + 'static` 的具体错误
+///     （如 alloy 的 `RpcError`，走 anyhow 提供的 `From<E>` 实现）。
 ///
 /// 领域说明：`classify` 会按错误文本里的关键词（not found / timeout / invalid …）
 /// 推断出 `ErrorCode`，从而让 HTTP 层能返回恰当的响应。
-fn fail(context: &str, err: impl std::fmt::Display) -> SdkError {
-    allchain_core::error::classify(&format!("{context}: {err}"))
+///
+/// ⚠️ 为什么必须收敛到 `anyhow::Error` 再打印，而不是直接 `Display`：
+/// `anyhow::Error` 的 `Display` **只打印最外层上下文**，根因（连接失败、超时、
+/// HTTP 状态码）在 `source()` 链里。用 `{err:#}`（alternate 标志）才能把整条链
+/// 用 `": "` 拼成一行——既保留中文上下文的可读性，又让 `classify` 看得见根因关键词。
+fn fail(context: &str, err: impl Into<anyhow::Error>) -> SdkError {
+    let err = err.into();
+    allchain_core::error::classify(&format!("{context}: {err:#}"))
 }
 
 /// 为 `EthClient` 实现跨链统一契约。
@@ -398,6 +409,107 @@ impl ChainClient for EthClient {
             "success": success,
             "block_number": block_number,
             "gas_used": gas_used,
+        })))
+    }
+
+    /// **无私钥**构造转账：向节点取齐 nonce / 费率 / chain id，组装出待签交易后交回调用方。
+    ///
+    /// 与 [`ChainClient::transfer`] 的分工：
+    /// - `transfer` 是**一段式**——私钥进 SDK，签名与广播也都在 SDK 内完成；
+    /// - `build_transfer` 是**两段式**的第一段——SDK 只负责组装，
+    ///   签名交给调用方（agent）用自己的私钥做，私钥从不进入本进程。
+    ///
+    /// 调用方拿到返回值后应做两件事：
+    ///   1. 用 `signing_payload_hex` 签名（ETH 是对它做 secp256k1 + EIP-155 可恢复签名）；
+    ///   2. 把签名装配回 `unsigned_tx_hex`，得到可广播字节，再交给 [`Self::submit_tx`]。
+    ///
+    /// 领域说明：`from` 只用于查 nonce，**不做任何权限校验**——
+    /// 无私钥就无法证明调用方拥有该地址。安全性由签名环节保障：
+    /// 没有对应私钥就签不出网络能接受的签名。
+    async fn build_transfer(&self, req: BuildTransferRequest) -> Result<BuildTransferView, SdkError> {
+        // 两个地址都在**本地**校验后再发请求，避免为拼错的字符白跑一次网络往返。
+        let from = parse_address(&req.from)?;
+        let to = parse_address(&req.to)?;
+        // 金额是人类可读的 ether 字符串，先转成最小单位 wei（纯整数运算）。
+        let value = crate::units::parse_amount(&req.amount, "ether")
+            .map_err(|e| SdkError::invalid_argument(format!("非法金额: {e}")))?;
+        let amount_raw = to_u128(value)?;
+
+        let unsigned =
+            crate::transactions::build_unsigned_transfer(&self.rpc_url, from, to, value)
+                .await
+                .map_err(|e| self.fail("构造未签名转账失败", e))?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Eth,
+            &self.network,
+            // 回显**用户原始输入**，便于批量场景下把结果对回具体请求。
+            req.from,
+            req.to,
+            amount_raw,
+            unsigned.unsigned_tx_hex,
+            // `B256::as_slice()` 取出底层 32 字节，`encode_hex_prefixed` 补上 0x。
+            hexutil::encode_hex_prefixed(unsigned.signing_hash.as_slice()),
+            "secp256k1",
+            "keccak256",
+        )
+        .with_extra(json!({
+            "chain_id": unsigned.chain_id,
+            "nonce": unsigned.nonce,
+            "gas_limit": crate::transactions::TRANSFER_GAS,
+            // 显式回吐交易类型：EIP-2718 的类型字节决定签名与重组规则，
+            // 调用方若换了类型（如 legacy 0x00）就必须换一套组装逻辑。
+            "tx_type": "eip1559",
+            "tx_type_byte": "0x02",
+            "max_fee_gwei": crate::units::format_wei(U256::from(unsigned.max_fee_per_gas), 9),
+            "max_priority_fee_gwei": crate::units::format_wei(U256::from(unsigned.max_priority_fee_per_gas), 9),
+            // 提示调用方签名后该走哪个接口闭环，省去查文档。
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易，返回交易哈希。
+    ///
+    /// 领域说明：只做 `eth_sendRawTransaction`，**不等回执**。
+    /// 广播成功 ≠ 执行成功——交易可能入块后 revert，也可能因费率过低滞留内存池，
+    /// 要确认结果请用 [`ChainClient::tx`] 查回执。
+    ///
+    /// 输入格式即标准 EIP-2718 编码：`0x02 || RLP(字段…, y_parity, r, s)`。
+    /// 它与 `build_transfer` 的 `unsigned_tx_hex` 是**同构的两兄弟**：
+    /// 后者是 9 个未签名字段，前者是 12 个字段（多出签名三元组）。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        // `as_deref()` 把 `Option<String>` 转成 `Option<&str>`，再用 `unwrap_or` 取默认值。
+        // 两步合一是为了让「没传编码」与「传了空串」都折算成缺省的 hex。
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+        // ETH 的广播字节是 RLP，只有十六进制一种形态；
+        // 明确拒绝 base64 而不是静默按 hex 解析——静默会把乱码变成一个
+        // 语义不明的「解析失败」，把真正的病因（编码传错）掩盖掉。
+        if encoding != "hex" {
+            return Err(SdkError::invalid_argument(format!(
+                "ETH 已签名交易只接受 hex 编码，收到 {encoding}"
+            )));
+        }
+
+        let raw = hexutil::decode_hex(&req.signed_tx_hex)?;
+        if raw.is_empty() {
+            return Err(SdkError::invalid_argument("已签名交易为空"));
+        }
+
+        let tx_hash = crate::transactions::broadcast_raw(&self.rpc_url, &raw)
+            .await
+            .map_err(|e| self.fail("广播已签名交易失败", e))?;
+
+        Ok(SubmitView::new(ChainKind::Eth, &self.network, tx_hash.to_string()).with_extra(json!({
+            "broadcast": true,
+            // 首字节即 EIP-2718 类型标志，回吐它便于调用方确认自己交的
+            // 确实是构造时的那一类交易（构造用 0x02，若这里变成其它值
+            // 说明签名方换过交易类型，两者将不匹配）。
+            "tx_type_byte": format!("0x{:02x}", raw[0]),
         })))
     }
 
@@ -667,5 +779,56 @@ mod tests {
         assert!(derive_address_from_pubkey(&format!("02{}", "ab".repeat(64))).is_err());
         let err = derive_address_from_pubkey("not-hex").unwrap_err();
         assert!(err.message.contains("非法十六进制"));
+    }
+
+    /// 回归测试：`fail` 必须保留 anyhow 的**整条错误链**。
+    ///
+    /// 领域说明：ETH 的底层错误（alloy 的 `RpcError`）通常是
+    /// `RpcError<TransportErrorKind> -> reqwest::Error -> hyper 错误` 的多层嵌套。
+    /// `anyhow::Error` 的普通 `Display` 只打印最外层，
+    /// 于是「连接被拒 / 超时 / 429 限流」这类**决定要不要重试**的信息会丢失，
+    /// `classify` 只能兜底判成 `RpcError`。
+    ///
+    /// 语法说明：`Err::<(), _>(..)` 用 turbofish 指定 Ok 侧的具类型 `()`，
+    /// 这样才能在 `Result` 上链式调用 `anyhow::Context::context`，
+    /// 再用 `unwrap_err()` 取出包装后的 `anyhow::Error`。
+    #[test]
+    fn fail_keeps_the_root_cause_of_a_nested_anyhow_error() {
+        use anyhow::Context;
+
+        let root = anyhow::anyhow!("error sending request for url (http://localhost:8545)");
+        let err = Err::<(), _>(root).context("查询余额失败").unwrap_err();
+
+        let sdk = fail("查询地址失败", err);
+
+        assert!(sdk.message.contains("查询地址失败"), "{}", sdk.message);
+        assert!(sdk.message.contains("查询余额失败"), "{}", sdk.message);
+        // 最关键的一条：根因必须透出。
+        assert!(
+            sdk.message.contains("error sending request"),
+            "根因被丢掉了: {sdk:?}"
+        );
+    }
+
+    /// 上面那条的关键断言：根因关键词必须**真的驱动分类**。
+    ///
+    /// 构造一个「外层中文上下文完全中性、只有根因带网络关键词」的错误，
+    /// 若 `fail` 丢链，这里会落到兜底的 `RpcError`（≠ `NetworkError`）而失败。
+    #[test]
+    fn root_cause_keywords_actually_drive_the_error_code() {
+        use allchain_core::ErrorCode;
+        use anyhow::Context;
+
+        let root = anyhow::anyhow!("connection refused");
+        let err = Err::<(), _>(root).context("查询余额失败").unwrap_err();
+
+        let sdk = fail("查询地址失败", err);
+        assert_eq!(sdk.code, ErrorCode::NetworkError, "message = {}", sdk.message);
+
+        // 反证：只给外层上下文时，分类结果必然不是 NetworkError。
+        assert_ne!(
+            allchain_core::error::classify("查询地址失败: 查询余额失败").code,
+            ErrorCode::NetworkError
+        );
     }
 }

@@ -34,8 +34,8 @@ pub use envelope::Envelope;
 pub use error::{ErrorCode, SdkError};
 // 大括号里可以一次导入多个条目，不必写多行 `pub use`。
 pub use model::{
-    AddressView, BalanceView, BlockView, StatusView, TransferRequest, TransferView, TxStatus,
-    TxView,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, StatusView,
+    SubmitRequest, SubmitView, TransferRequest, TransferView, TxStatus, TxView,
 };
 // `ChainClient` 是 trait，重导出方式与 struct / enum 完全一致。
 pub use traits::ChainClient;

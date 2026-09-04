@@ -21,7 +21,10 @@ use std::time::Instant;
 // `ChainClient` 是十条链各自实现的 trait（运行时多态的入口），
 // `ChainKind` 是链标识枚举，`Envelope` / `SdkError` / `ErrorCode` 是统一输出结构，
 // `TransferRequest` 是转账入参（按值整体交给适配器）。
-use allchain_core::{ChainClient, ChainKind, Envelope, ErrorCode, SdkError, TransferRequest};
+use allchain_core::{
+    BuildTransferRequest, ChainClient, ChainKind, Envelope, ErrorCode, SdkError, SubmitRequest,
+    TransferRequest,
+};
 // `serde_json::Value` 是「任意 JSON 值」的动态类型。十条的返回体类型各不相同
 // （ChainStatus / Balance / BlockInfo ...），本层统一擦除成 `Value`：
 // 代价是丢失编译期类型检查，换来的是三形态共用同一个返回结构。
@@ -79,6 +82,37 @@ pub enum Action {
         dry_run: bool,
         /// 源账户；NEAR 命名账户必填，其余链可从私钥自动派生。
         from: Option<String>,
+    },
+    /// **无私钥**构造转账——两段式的第一阶段。
+    ///
+    /// 与 `Transfer` 的根本差别：**这里没有 `private_key` 字段**。
+    /// SDK 只负责查链上状态（nonce / gas / blockhash / UTXO）并组装未签名交易，
+    /// 私钥始终留在调用方（agent）一侧。
+    BuildTransfer {
+        /// 付款地址/账户。**必填**——没有私钥可供推导地址，故不能像 `Transfer` 那样缺省。
+        from: String,
+        /// 收款地址。
+        to: String,
+        /// 金额字符串，原生单位（如 `0.01`）。
+        amount: String,
+        /// 签名公钥；仅 NEAR / APT 等「账户与密钥解耦」的链需要，
+        /// AR 则**必须**传（RSA 模数，因为 AR 地址是模数的摘要、无法反推）。
+        public_key: Option<String>,
+    },
+    /// 广播**已签名**交易——两段式的第二阶段。
+    ///
+    /// 只接收签完名的字节，全程不接触私钥。与 `BuildTransfer` 配对，
+    /// 构成「SDK 构造 → agent 签名 → SDK 广播」的闭环。
+    SubmitTx {
+        /// 已签名交易的十六进制（或 `encoding` 为 `base64` 时的 base64 串）。
+        signed_tx_hex: String,
+        /// 编码：`None` 视为 `hex`。
+        encoding: Option<String>,
+        /// 构造阶段下发、此处**原样回传**的不透明上下文（TON 的 cell 树需要）。
+        context: Option<Value>,
+        /// 多签名列表（BTC 的每个 UTXO 输入各一个签名），
+        /// 顺序须与 `build_transfer` 下发的待签对象一一对应。
+        signatures: Option<Vec<String>>,
     },
 }
 
@@ -260,6 +294,58 @@ pub async fn run_action(
                 }
             }
         }
+        // 两段式的两个阶段。与 `Transfer` 一样先做**能力检查**再发请求：
+        // 未实现的链在协议层返回 UNSUPPORTED，而不是打一次必然失败的网络请求。
+        Action::BuildTransfer {
+            from,
+            to,
+            amount,
+            public_key,
+        } => {
+            if !chain.supports_build_transfer() {
+                Err(SdkError::unsupported(format!(
+                    "{} 暂不支持无私钥构造转账（AR 因地址是模数摘要、无法反推公钥，故不在其列）",
+                    chain
+                )))
+            } else {
+                // 注意：这里**不**解析私钥、也**不**读环境变量——本分支全程不接触私密材料，
+                // 这正是两段式相对 `Transfer` 的意义。
+                client
+                    .build_transfer(BuildTransferRequest {
+                        from,
+                        to,
+                        amount,
+                        public_key,
+                    })
+                    .await
+                    .and_then(to_value)
+                    .map(|v| with_rpc(v, &rpc_url))
+            }
+        }
+        Action::SubmitTx {
+            signed_tx_hex,
+            encoding,
+            context,
+            signatures,
+        } => {
+            if !chain.supports_submit() {
+                Err(SdkError::unsupported(format!(
+                    "{} 暂不支持广播已签名交易",
+                    chain
+                )))
+            } else {
+                client
+                    .submit_tx(SubmitRequest {
+                        signed_tx_hex,
+                        encoding,
+                        context,
+                        signatures,
+                    })
+                    .await
+                    .and_then(to_value)
+                    .map(|v| with_rpc(v, &rpc_url))
+            }
+        }
     };
 
     // 再次打点：耗时覆盖「构造适配器 + 执行动作 + 序列化」全过程，成功失败都计入。
@@ -336,6 +422,10 @@ pub fn parse_chain(raw: &str) -> Result<ChainKind, SdkError> {
 fn private_key_env(chain: ChainKind) -> &'static str {
     match chain {
         ChainKind::Eth => "ETH_SECRET_KEY",
+        // BTC 的 `BTC_WIF` 同样已走不到：BTC 侧已移除本地签名，
+        // `transfer` 会直接返回 UNSUPPORTED（BTC 只能走两段式）。
+        // 保留这个名字而非改成空串，是为了仍与单链 CLI 的口径一致，
+        // 也让「BTC 曾经支持过一体式」这件事在代码里留下痕迹。
         ChainKind::Btc => "BTC_WIF",
         ChainKind::Sol => "SOL_KEYPAIR",
         ChainKind::Near => "NEAR_SECRET_KEY",

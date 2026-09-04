@@ -25,5 +25,11 @@ pub mod network;
 pub mod queries;
 /// 从 WIF 私钥派生地址、选币、构造交易并离线签名。
 pub mod transactions;
+/// **无私钥两段式**模块：只凭公钥构造待签模板、逐输入算 sighash、验签后重组。
+///
+/// BTC 与其它链最大的结构差异在这里：它是 UTXO 模型，
+/// **每个输入各有一个 sighash**，所以待签材料是数组而非单个值。
+/// 详见模块内文档。
+pub mod tx;
 /// BTC / satoshi 换算、费率解析与 vsize 估算。
 pub mod units;

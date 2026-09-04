@@ -14,8 +14,8 @@ members = [
     "chain/fil",
     "chain/sui",
     "chain/ton",
-    "sign",
 ]
+# 注：`sign` 已移出本 workspace，成为 `../sign` 独立 crate（经相对路径依赖 core）。
 
 [workspace.package]
 version = "0.1.0"

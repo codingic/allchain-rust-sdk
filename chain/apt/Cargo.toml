@@ -14,6 +14,10 @@ allchain-core = { workspace = true }
 chain-rpcutil = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# 广播接口接受 base64 编码的已签名交易——Aptos 生态（TS SDK、钱包适配器）
+# 交换交易字节时惯用 base64，不接受它就得让调用方自己转一道。
+base64 = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

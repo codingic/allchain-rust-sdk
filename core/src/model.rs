@@ -622,6 +622,265 @@ impl TransferView {
     }
 }
 
+/// 「无私钥」转账构造请求：调用方（agent）只给付款方、收款方、金额，**不提供私钥**。
+///
+/// 领域说明——为什么要与 [`TransferRequest`] 分开成两个类型：
+/// - `TransferRequest` 是**一体式**：SDK 拿私钥，包办构造 + 签名 + 广播；
+/// - 本结构体是**两段式**：SDK 只负责**构造**，签名与广播权留在 agent 手里。
+///
+/// 必须拆成两段的原因有两面：私钥一旦离开 agent 就多一处泄漏面；而构造交易又
+/// **必须**依赖链上状态（nonce / gas / 最近 blockhash / UTXO），agent 自己离线构造
+/// 不出来。拆开后 agent 只需对 SDK 返回的 `signing_payload_hex` 做一次签名运算。
+///
+/// 语法说明：这里与 `TransferRequest` 相反，**可以**派生 `Serialize` / `Deserialize`——
+/// 结构体里没有任何私密材料，序列化是安全的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildTransferRequest {
+    /// 付款地址/账户（各链原生格式）。没有私钥可供推导，故本字段**必填**。
+    pub from: String,
+    /// 收款地址（各链原生格式，由适配器解析）。
+    pub to: String,
+    /// 人类可读的原生单位金额，如 `"0.01"`；同 [`TransferRequest::amount`]，
+    /// 用字符串而非 f64，避免十进制小数在二进制浮点里变成 0.00999999… 这类误差。
+    pub amount: String,
+    /// 签名所用的公钥（可选）。**只有少数链需要它**：
+    /// EVM / BTC / SOL 的交易体里不含公钥（可从签名恢复或由 UTXO 自带），
+    /// 而 NEAR / APT / SUI 的账户模型把「账户 ↔ 密钥」解耦了
+    /// ——账户名下可能挂多把 key，构造交易时必须写明用哪一把。
+    ///
+    /// 不填时的行为由各链自行决定：能从账户名反推就反推（如 NEAR 的隐式账户），
+    /// 否则查链上密钥列表并在唯一命中时采用，多把 key 时报错。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+/// `from` / `to` / `amount` 三个字段必填，`public_key` 可选。
+impl BuildTransferRequest {
+    /// `impl Into<String>` 让调用方既能传 `String` 也能传 `&str`：
+    /// 传 `&str` 时内部会分配一次，传 `String` 则直接接管所有权、零拷贝。
+    pub fn new(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        amount: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            amount: amount.into(),
+            public_key: None,
+        }
+    }
+
+    /// 显式指定签名公钥（NEAR / APT 等多密钥链需要）。
+    ///
+    /// 语法说明：链式构造（builder 风格）靠 `self` 按值传入、`mut self` 修改后
+    /// 再原样返回。因为取得的是**所有权**而不是借用，链式调用不会留下悬垂引用。
+    pub fn with_public_key(mut self, public_key: impl Into<String>) -> Self {
+        self.public_key = Some(public_key.into());
+        self
+    }
+}
+
+/// 「无私钥」转账构造结果：给出未签名交易，以及**真正要签的那段字节**。
+///
+/// 领域说明——`unsigned_tx_hex` 与 `signing_payload_hex` 是两份不同的数据，
+/// 这是本设计的核心。多数链里「最终交易字节」并不等于「待签字节」：
+/// - ETH：待签对象是 `0x02 || RLP(未签名字段)` 的 **keccak256 哈希**，
+///   而最终交易是 `0x02 || RLP(字段 + 签名)`；
+/// - SOL / NEAR / APT / SUI：待签对象是序列化后的**消息体**，最终交易再外挂签名。
+///
+/// 若只返回 `unsigned_tx_hex`，调用方就得自己懂每条链的编码细节；签错时**不会报错**，
+/// 只会得到一个广播即失败的无效交易——这类静默错误排查成本极高。故显式给出
+/// `signing_payload_hex` 与算法标识，让 agent 照着签即可。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildTransferView {
+    /// 所属链（自解释字段）。
+    pub chain: ChainKind,
+    /// 网络名。
+    pub network: String,
+    /// 付款地址/账户。
+    pub from: String,
+    /// 收款地址。
+    pub to: String,
+    /// 最小单位整数字符串（wei / satoshi / lamport / yoctoNEAR）。
+    pub amount_raw: String,
+    /// 人类可读金额，按 `decimals` 换算。
+    pub amount_ui: String,
+    /// 资产符号，由构造器按链推导。
+    pub symbol: String,
+    /// 未签名交易的十六进制（带 `0x` 前缀）：既是待签哈希的原像，
+    /// 也是签名后组装最终交易的基底。
+    pub unsigned_tx_hex: String,
+    /// **真正要签的字节或哈希**（带 `0x` 前缀）。调用方用自己的私钥对它做签名运算。
+    pub signing_payload_hex: String,
+    /// 签名算法：`secp256k1` / `ed25519` / `rsa` 等。
+    pub signature_scheme: String,
+    /// 对 payload 做摘要的算法：`keccak256` / `sha256` / `blake2b-256`；
+    /// `none` 表示 payload 已是最终摘要、无需再哈希（ed25519 系多属此类）。
+    pub hash_algorithm: String,
+    /// 链专有信息（nonce / gas / blockhash / 选中的 UTXO 等），便于审计与复现。
+    #[serde(flatten)]
+    pub extra: Value,
+}
+
+/// 构造器 + `with_extra`：与 [`TransferView`] 保持同一套写法。
+impl BuildTransferView {
+    /// 只收最小单位整数，`amount_ui` 与 `symbol` 由构造函数统一派生，
+    /// 避免同一笔金额在两个字段里出现不一致的写法。
+    ///
+    /// 语法说明：`#[allow(clippy::too_many_arguments)]` 关掉「参数过多」告警。
+    /// 9 个参数确实偏多，但它们分属四组语义（链上下文 / 收发双方 / 金额 /
+    /// 待签材料），且**没有一个是可推导的**——收成配置结构体只会把「必填」
+    /// 变成「可遗漏」。相比让每条链各自塞一个 builder，显式豁免更诚实。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        chain: ChainKind,
+        network: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        amount_raw: u128,
+        unsigned_tx_hex: impl Into<String>,
+        signing_payload_hex: impl Into<String>,
+        signature_scheme: impl Into<String>,
+        hash_algorithm: impl Into<String>,
+    ) -> Self {
+        Self {
+            chain,
+            network: network.into(),
+            from: from.into(),
+            to: to.into(),
+            amount_raw: amount_raw.to_string(),
+            amount_ui: crate::chain::format_units(amount_raw, chain.decimals()),
+            symbol: chain.symbol().to_string(),
+            unsigned_tx_hex: unsigned_tx_hex.into(),
+            signing_payload_hex: signing_payload_hex.into(),
+            signature_scheme: signature_scheme.into(),
+            hash_algorithm: hash_algorithm.into(),
+            extra: no_extra(),
+        }
+    }
+
+    /// 整体替换 extra，语义同 [`TransferView::with_extra`]。
+    pub fn with_extra(mut self, extra: Value) -> Self {
+        self.extra = extra;
+        self
+    }
+}
+
+/// 广播已签名交易的请求：只接收**签完名**的交易字节，全程不接触私钥。
+///
+/// 与构造接口（[`BuildTransferRequest`]）配对使用，构成「SDK 构造 → agent 签名
+/// → SDK 广播」的闭环，私钥只存在于 agent 一侧。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitRequest {
+    /// 已签名交易的十六进制（带 `0x` 前缀）；`encoding` 为 `base64` 时此处是 base64 串。
+    pub signed_tx_hex: String,
+    /// 编码：`hex`（默认，None 即视为 hex）或 `base64`（SOL / SUI 等）。
+    /// 用 `Option` 而非必填，是为了让大多数链（ETH / BTC / NEAR / APT …）
+    /// 的调用方能省掉这个参数。
+    pub encoding: Option<String>,
+    /// 构造阶段下发、广播阶段**原样回传**的不透明上下文。
+    ///
+    /// 为什么需要它：多数链的交易是扁平字节，签完直接覆盖末尾签名即可，
+    /// 广播接口收到的是一份**自包含**的交易。但 TON 不是——它的交易是
+    /// cell 树，签名既不在末尾、也不字节对齐（会跨 65 个字节），
+    /// 因此「拿模板覆盖一段字节」这条路根本走不通。
+    ///
+    /// 这类链的做法是：`build_transfer` 在 `extra.submit_context` 里下发
+    /// 重组所需的参数，调用方签完名后把它原样塞回这里。
+    /// SDK 不要求调用方理解其中内容——**复制回来即可**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    /// 多签名列表：**按 `build_transfer` 下发 `signing_payloads` 的顺序一一对应**。
+    ///
+    /// 为什么需要它：多数链一笔交易只有一个待签对象，签完直接塞进
+    /// `signed_tx_hex`（扁平字节）即可。但 BTC 是 **UTXO 模型**——
+    /// 每个输入都要单独签一个 sighash，N 个输入就是 N 个签名。
+    /// 用一个字符串承载 N 段变长签名只能靠拼接，而拼接格式一旦需要
+    /// 「解析回去」就必然要猜边界，猜错的代价是**广播一笔无效交易**。
+    ///
+    /// 因此这里用数组显式承载：`signatures[i]` 对应第 `i` 个待签对象。
+    /// 需要它的链（当前是 BTC）会在 `build_transfer` 的 extra 里说明顺序与编码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<Vec<String>>,
+}
+
+impl SubmitRequest {
+    /// 默认 hex 编码的便捷构造。
+    pub fn new(signed_tx_hex: impl Into<String>) -> Self {
+        Self {
+            signed_tx_hex: signed_tx_hex.into(),
+            encoding: None,
+            context: None,
+            signatures: None,
+        }
+    }
+
+    /// 指定编码（如 `base64`）。
+    pub fn with_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = Some(encoding.into());
+        self
+    }
+
+    /// 携带构造阶段下发的上下文（TON 等无法字节拼接的链需要）。
+    ///
+    /// 语义说明：这里存的是 `build_transfer` 返回的 `extra.submit_context`
+    /// **原值**，调用方不应解析或修改它。
+    pub fn with_context(mut self, context: Value) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    /// 携带签名数组（BTC 这类多待签对象的链需要）。
+    ///
+    /// 语义说明：`signatures` 与 `build_transfer` 下发的 `signing_payloads`
+    /// **按索引一一对应**，顺序错了验签会失败——SDK 在广播前会逐个验签，
+    /// 因此不会把错序的签名送上链。
+    ///
+    /// 语法说明：`Vec<impl Into<String>>` 是「元素各自转换」的写法，
+    /// 调用方既能传 `Vec<String>` 也能传 `Vec<&str>`；
+    /// 内部的 `into_iter().map(Into::into).collect()` 会为每个元素单独做转换。
+    pub fn with_signatures(mut self, signatures: Vec<impl Into<String>>) -> Self {
+        self.signatures = Some(signatures.into_iter().map(Into::into).collect());
+        self
+    }
+}
+
+/// 广播结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitView {
+    /// 所属链（自解释字段）。
+    pub chain: ChainKind,
+    /// 网络名。
+    pub network: String,
+    /// 交易哈希 / txid / signature。
+    pub tx_hash: String,
+    /// 链专有信息（如是否需等确认、gas 用量等）。
+    #[serde(flatten)]
+    pub extra: Value,
+}
+
+impl SubmitView {
+    pub fn new(
+        chain: ChainKind,
+        network: impl Into<String>,
+        tx_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            chain,
+            network: network.into(),
+            tx_hash: tx_hash.into(),
+            extra: no_extra(),
+        }
+    }
+
+    /// 整体替换 extra，语义同 [`TransferView::with_extra`]。
+    pub fn with_extra(mut self, extra: Value) -> Self {
+        self.extra = extra;
+        self
+    }
+}
+
 /// 便捷构造：把若干字段放进 extra。
 ///
 /// 参数 `&[(&str, Value)]` 是**元组切片**：每一项是「键 + 值」的二元组。

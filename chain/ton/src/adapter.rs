@@ -32,20 +32,24 @@ use tokio::time::{Instant, sleep};
 // 注意导入列表里**没有** `AddressView`：本适配器不实现 `address_from_pubkey`，
 // 多导入反而会触发「未使用导入」警告。
 use allchain_core::{
-    BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView, TxStatus,
-    TxView, TransferRequest, TransferView,
+    BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient, ChainKind,
+    ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TxStatus, TxView, TransferRequest,
+    TransferView,
 };
 // `parse_units` 把人类可读的 ton 数量（如 `1.5`）解析成最小单位整数（nanoton），
 // 六条新链的 `transfer` 都依赖它，避免 f64 精度丢失。
+use allchain_core::hexutil::{decode_hex, encode_hex};
 use allchain_core::parse_units;
 // `url_encode` 在这里很关键：TON 的用户友好地址含 `+` 与 `/`，
 // 放进 query 前必须转义，否则 `+` 会被服务端解成空格。
 use chain_rpcutil::{Http, field_u64, loose_u128, url_encode};
 
 // TON 转账需要本地构造并签名「钱包外部消息」，依赖 tonlib-core 的密钥/钱包/Cell 工具。
-use num_bigint::BigUint;
-use tonlib_core::cell::{EMPTY_ARC_CELL};
-use tonlib_core::message::{CommonMsgInfo, InternalMessage, TonMessage, TransferMessage};
+//
+// 注意这里**不再**引入 `BigUint` / `InternalMessage` / `TransferMessage`：
+// 内部转账消息的构造已经收敛到 `crate::tx::build_internal_message`，
+// 一体式 `transfer` 与两段式 `build_transfer` 共用同一份字段约定，
+// 避免两条路径各自演化出不一致的 bounce / fee 写法。
 use tonlib_core::tlb_types::tlb::TLB;
 use tonlib_core::wallet::mnemonic::{KeyPair, Mnemonic};
 use tonlib_core::wallet::ton_wallet::TonWallet;
@@ -256,6 +260,65 @@ impl TonClient {
             Some(s) => Ok((s as u32, false)),
             None => Ok((0, true)),
         }
+    }
+
+    /// 外部消息有效期：当前时间 + `ttl_secs` 秒。
+    ///
+    /// 领域说明：TON 的钱包外部消息自带 `valid_until`，超时后节点直接丢弃。
+    /// 它**参与签名**，所以一体式 `transfer` 与两段式 `build_transfer`
+    /// 必须用同一个取法，否则同样的交易会算出不同的待签哈希。
+    ///
+    /// 取 60 秒是权衡：太短则在调用方签名慢一点时就过期，
+    /// 太长则一笔失败的交易会在内存池里滞留更久。
+    fn expire_at_from_now(ttl_secs: u64) -> Result<u32, SdkError> {
+        // `SystemTime::now()` 是**墙上时钟**（可被 NTP 回拨），
+        // 不适合做超时计时，但这里要的是「绝对时间点」且要写进交易里，
+        // 因此正是墙上时钟的适用场景。
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("系统时钟异常: {e}")))?
+            .as_secs()
+            .checked_add(ttl_secs)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| SdkError::new(ErrorCode::Internal, "外部消息有效期溢出 u32"))
+    }
+
+    /// 把调用方给的 `public_key` 解析成「钱包版本 + 公钥」，并校验它推导出的
+    /// 地址确实是 `from`。
+    ///
+    /// 领域说明：TON 的地址 = hash(合约代码 + 初始数据)，而**合约代码由钱包版本
+    /// 决定**。所以「同一把公钥 + 不同版本」会得到完全不同的地址。
+    /// 这意味着版本不是可选修饰，而是**地址的组成部分**——故必须校验，
+    /// 否则调用方写错版本时会构造出一笔「给另一个钱包的」交易，而且不会报错。
+    fn resolve_signer(
+        &self,
+        public_key: Option<&str>,
+        from: &TonAddress,
+    ) -> Result<(WalletVersion, [u8; 32], TonAddress), SdkError> {
+        let raw = public_key.ok_or_else(|| {
+            SdkError::invalid_argument(
+                "TON 无私钥构造必须提供 public_key：它是钱包初始数据的一部分，\
+                 没有它既推不出地址也拼不出 StateInit。\
+                 需要指定钱包版本时写成 `<版本>:<公钥hex>`，如 `v5r1:ab..cd`；不写默认 v4r2。",
+            )
+        })?;
+        let (version, public_key) = crate::tx::parse_signer_public_key(raw)?;
+        let wallet = crate::tx::wallet_from_public_key(
+            version,
+            &public_key,
+            from.workchain,
+            crate::tx::default_wallet_id(version),
+        )?;
+        if wallet.address != *from {
+            return Err(SdkError::invalid_argument(format!(
+                "公钥 + 钱包版本 {} 推导出的地址是 {}，与 from {} 不一致\
+                 （多半是钱包版本填错——同一把公钥在不同版本下地址不同）",
+                crate::tx::version_name(version),
+                wallet.address,
+                from
+            )));
+        }
+        Ok((version, public_key, wallet.address))
     }
 
     /// 广播后定位自身最新交易，构造可查询的 locator `<hash>:<lt>@<address>`。
@@ -514,37 +577,18 @@ impl ChainClient for TonClient {
         // 取钱包 seqno：未激活账户 toncenter 返回 seqno=null，需附带 StateInit 部署上链。
         let (seqno, add_state_init) = self.fetch_seqno(&from).await?;
 
-        // 构造内部转账消息：bounce=true 让目标为 bounceable 地址时失败可退回；
-        // ihr_disabled/fwd_fee 置 0 是钱包转账的标准写法。
-        let int_msg = InternalMessage {
-            ihr_disabled: true,
-            bounce: true,
-            bounced: false,
-            src: wallet.address.clone(),
-            dest: recipient,
-            value: BigUint::from(amount_raw),
-            ihr_fee: BigUint::from(0u32),
-            fwd_fee: BigUint::from(0u32),
-            created_lt: 0,
-            created_at: 0,
-        };
-        let transfer_msg = TransferMessage::new(
-            CommonMsgInfo::InternalMessage(int_msg),
-            EMPTY_ARC_CELL.clone(),
-        );
-        let int_cell = transfer_msg
-            .build()
-            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造内部转账消息失败: {e}")))?;
+        // 内部转账消息改用 `tx` 模块的共用构造：bounce / fee / created_lt 这些
+        // 字段约定只留一份，两段式 `build_transfer` 走的是同一个函数，
+        // 两条路径不会各自演化。
+        let int_cell =
+            crate::tx::build_internal_message(&wallet.address, &recipient, amount_raw)?;
 
         // 外部消息有效期：当前时间 + 60 秒。超时后节点会拒绝，避免重放。
-        let expire_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("系统时钟异常: {e}")))?
-            .as_secs()
-            + 60) as u32;
+        // 与 `expire_at_from_now` 同名 helper 保持同一取法（它也参与签名）。
+        let expire_at = Self::expire_at_from_now(60)?;
 
         let ext_cell = wallet
-            .create_external_msg(expire_at, seqno, add_state_init, &[int_cell.to_arc()])
+            .create_external_msg(expire_at, seqno, add_state_init, &[int_cell])
             .map_err(|e| SdkError::new(ErrorCode::Internal, format!("构造外部消息失败: {e}")))?;
 
         if req.dry_run {
@@ -591,6 +635,160 @@ impl ChainClient for TonClient {
                 "queryable": queryable,
             })))
         }
+    }
+
+    /// 无私钥构造转账：只拼装外部消息，把**待签哈希**交给调用方。
+    ///
+    /// 领域说明：与一体式 [`ChainClient::transfer`] 的差别只有一处——
+    /// 签名不在这里发生。构造外部消息仍然**必须联网**，因为它依赖两个链上事实：
+    /// 钱包 `seqno`（防重放）以及账户是否已部署（决定要不要带 StateInit）。
+    ///
+    /// **`public_key` 在 TON 上是必填的**，原因比其他链更硬：
+    /// 它是钱包合约初始数据的一部分，既是推导地址的输入，也是拼 StateInit 的输入。
+    /// 更进一步，**钱包版本也必填**（默认 v4r2）：地址 = hash(合约代码 + 初始数据)，
+    /// 而合约代码由版本决定——同一把公钥在 V4R2 与 V5R1 下是两个完全不同的钱包。
+    ///
+    /// ⚠️ **本链不支持「覆盖一段字节」那种拼装方式**（ETH / NEAR / APT / SUI 可以）。
+    /// TON 的签名既不在 BOC 末尾、也不字节对齐（实测横跨 65 个字节，
+    /// 见 `tx::signature_span_bytes` 及其测试）。因此调用方拿到签名后，
+    /// 要把它连同 `extra.submit_context` 一起交给 [`ChainClient::submit_tx`]，
+    /// 由 SDK 重组消息。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        // 地址解析本身就是强校验（含 base64 与 CRC16），失败即为参数错误。
+        let sender = req
+            .from
+            .trim()
+            .parse::<TonAddress>()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 TON 付款地址 {}: {e}", req.from)))?;
+        let recipient = req
+            .to
+            .trim()
+            .parse::<TonAddress>()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 TON 收款地址 {}: {e}", req.to)))?;
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+
+        // 版本 + 公钥，并校验它们推导出的地址确实是 `from`。
+        let (version, public_key, sender) =
+            self.resolve_signer(req.public_key.as_deref(), &sender)?;
+
+        // 链上状态：seqno 与「是否已部署」。
+        let (seqno, add_state_init) = self.fetch_seqno(&sender.to_string()).await?;
+        let expire_at = Self::expire_at_from_now(60)?;
+
+        let params = crate::tx::TransferParams {
+            version,
+            wallet_id: crate::tx::default_wallet_id(version),
+            workchain: sender.workchain,
+            public_key,
+            recipient: recipient.clone(),
+            amount_raw,
+            seqno,
+            expire_at,
+            add_state_init,
+        };
+        let unsigned = crate::tx::assemble_unsigned(&params)?;
+        let context = serde_json::to_value(crate::tx::SubmitContext::from_params(&params))
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("序列化 submit_context 失败: {e}")))?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Ton,
+            &self.network,
+            req.from,
+            req.to,
+            amount_raw,
+            unsigned.unsigned_tx_hex,
+            unsigned.signing_payload_hex,
+            "ed25519",
+            // payload 已是 32 字节的 cell hash（由 SDK 算好），
+            // 调用方直接用 ed25519 签它，不要再哈希一次。
+            "none",
+        )
+        .with_extra(json!({
+            "public_key": encode_hex(&public_key),
+            "wallet_version": crate::tx::version_name(version),
+            "wallet_id": params.wallet_id,
+            "workchain": sender.workchain,
+            "seqno": seqno,
+            "expire_at": expire_at,
+            "add_state_init": add_state_init,
+            // 待签哈希的原像，便于调用方核对「签的到底是不是这笔转账」。
+            "message_body_hex": unsigned.message_body_hex,
+            // 广播时必须原样回传——它承载了重组消息所需的全部参数。
+            "submit_context": context,
+            "splice": "not_byte_splicable__pass_signature_and_submit_context_to_submit_tx",
+            "note": "对 signing_payload_hex（32 字节 cell hash）做 ed25519 签名；\
+                     然后把 64 字节签名放进 SubmitRequest.signed_tx_hex、\
+                     把本响应里的 submit_context 放进 SubmitRequest.context，调用 submit_tx",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易。
+    ///
+    /// ⚠️ **TON 是本接口唯一的例外**：`signed_tx_hex` 在这里不是交易字节，
+    /// 而是 **64 字节的 ed25519 签名**（128 个十六进制字符）。
+    /// 原因见 [`Self::build_transfer`]——TON 无法用「覆盖一段字节」拼装，
+    /// 重组必须由 SDK 完成，于是入参就是「上下文 + 签名」两件东西。
+    ///
+    /// 因为手里同时有公钥与待签哈希，本方法会**先本地验签再广播**：
+    /// 签名与上下文对不上时给出明确错误，而不是丢给节点换一句含义不明的拒绝。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        let context = req.context.clone().ok_or_else(|| {
+            SdkError::invalid_argument(
+                "TON 广播必须回传 build_transfer 下发的 extra.submit_context：\
+                 交易的签名位置不字节对齐，无法由调用方自行拼装",
+            )
+        })?;
+        let ctx: crate::tx::SubmitContext = serde_json::from_value(context).map_err(|e| {
+            SdkError::invalid_argument(format!("submit_context 不是本 SDK 下发的格式: {e}"))
+        })?;
+
+        // 签名按 `encoding` 解，与其余链保持同样的宽松度。
+        let signature = match req.encoding.as_deref().map(str::trim) {
+            None | Some("") | Some("hex") => decode_hex(&req.signed_tx_hex)?,
+            Some("base64") => base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                req.signed_tx_hex.trim(),
+            )
+            .map_err(|_| SdkError::invalid_argument("signed_tx_hex 不是合法的 base64"))?,
+            Some(other) => {
+                return Err(SdkError::invalid_argument(format!(
+                    "不支持的编码 {other}（仅支持 hex / base64）"
+                )))
+            }
+        };
+
+        // 广播前验签：上下文被改过、或签名不是对这笔交易签的，都在这里拦下。
+        crate::tx::verify_signature(&ctx, &signature)?;
+
+        let params = ctx.to_params()?;
+        let wallet = crate::tx::wallet_from_public_key(
+            params.version,
+            &params.public_key,
+            params.workchain,
+            params.wallet_id,
+        )?;
+        let from = wallet.address.to_string();
+
+        let boc = crate::tx::assemble_signed(&ctx, &signature)?;
+        let b64 = crate::tx::encode_boc_for_broadcast(&boc)?;
+        let _ = self
+            .post_call("/sendBoc".to_string(), &[("boc", b64.as_str())])
+            .await?;
+
+        // 广播后尝试回填可查询的 tx_hash；查不到也不算失败（TON 落块有延迟）。
+        let tx_hash = self.locate_own_tx(&from).await;
+        let tx_hash = tx_hash.unwrap_or_default();
+        let queryable = !tx_hash.is_empty();
+
+        Ok(SubmitView::new(ChainKind::Ton, &self.network, tx_hash).with_extra(json!({
+            "broadcast": true,
+            "queryable": queryable,
+            "wallet_version": crate::tx::version_name(params.version),
+        })))
     }
 
     // 不实现 address_from_pubkey：TON 地址是钱包合约 StateInit 的哈希，

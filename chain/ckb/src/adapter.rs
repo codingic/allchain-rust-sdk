@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest,
+    TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 use chain_rpcutil::{Http, loose_u64, loose_u128};
 
@@ -32,13 +33,16 @@ use ckb_types::{
     prelude::*,
 };
 use official_ckb_sdk::{
-    constants::SIGHASH_TYPE_HASH,
+    constants::{MIN_SECP_CELL_CAPACITY, ONE_CKB, SIGHASH_TYPE_HASH},
     rpc::CkbRpcClient,
     traits::{
         DefaultCellCollector, DefaultCellDepResolver, DefaultHeaderDepResolver,
         DefaultTransactionDependencyProvider, SecpCkbRawKeySigner, Signer,
     },
-    tx_builder::{transfer::CapacityTransferBuilder, CapacityBalancer, TxBuilder},
+    tx_builder::{
+        transfer::CapacityTransferBuilder, CapacityBalancer, ScriptGroups, TxBuilder,
+        gen_script_groups,
+    },
     unlock::{ScriptUnlocker, SecpSighashUnlocker},
     Address, ScriptId, SECP256K1,
 };
@@ -52,6 +56,20 @@ use crate::network::{self, NetworkArg};
 
 // JSON-RPC 的 limit 参数同样是十六进制字符串；0x64 = 100。
 const PAGE_LIMIT: &str = "0x64"; // 每页 100 个 live cell
+
+/// 手续费率，单位 shannons/KB。1000 是 ckb-sdk 示例里的常用值
+/// （约等于最低档费率，能被节点接受）。
+///
+/// 三条转账路径（一体式 `transfer`、两段式 `build_transfer`、
+/// 离线对拍测试）都用这一个常量，避免同一个概念散落多处后漂移。
+const FEE_RATE: u64 = 1000;
+
+/// 手续费硬上限（1 CKB）。
+///
+/// 领域说明：cell 收集是贪心的——若余额足够分散，`CapacityBalancer`
+/// 可能塞进上百个 input 让交易体积暴涨，手续费随之失控。
+/// 这里设上限让构造**直接失败**，好过构造出一笔「费用比转账额还高」的交易。
+const MAX_FEE: u64 = ONE_CKB;
 
 /// CKB 客户端：绑定一个 JSON-RPC 端点 + 一个 reqwest 连接池。
 ///
@@ -184,6 +202,99 @@ impl CkbClient {
         }
         Ok(total)
     }
+
+    /// 构造交易所需的四个「环境依赖」：cell 收集器、cell_dep / header_dep 解析器、
+    /// 以及前序交易提供者。
+    ///
+    /// 领域说明：CKB 构造一笔转账要访问链上四次不同性质的数据——
+    ///   - 发送方名下的 live cell（`CellCollector`）
+    ///   - 系统脚本的 cell dep（`CellDepResolver`，由创世区块推导）
+    ///   - 若用到 since/时间锁，还要 header dep（`HeaderDepResolver`）
+    ///   - 每个 input 指向的前序交易，用来取回被花费 cell 的 lock script
+    ///     （`TransactionDependencyProvider`，`gen_script_groups` 要用）
+    ///
+    /// 抽成一个方法，是为了让一体式 `transfer` 与两段式 `build_transfer`
+    /// 走**完全相同**的环境。两条路径若环境不同（比如不同的 fee_rate、
+    /// 不同的 max_fee），产出的交易字节就会不同，
+    /// 「两段式与一体式等价」这个保证也就无从谈起。
+    fn build_deps(&self) -> Result<BuildDeps, SdkError> {
+        let cell_collector = DefaultCellCollector::new(self.rpc_url.as_str());
+        let tx_dep_provider = DefaultTransactionDependencyProvider::new(self.rpc_url.as_str(), 10);
+        let ckb_client = CkbRpcClient::new(self.rpc_url.as_str());
+        let genesis_block = ckb_client
+            .get_block_by_number(0.into())
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("获取创世区块失败: {e}")))?
+            .ok_or_else(|| SdkError::new(ErrorCode::RpcError, "创世区块不存在"))?;
+        let cell_dep_resolver =
+            DefaultCellDepResolver::from_genesis(&CoreBlockView::from(genesis_block))
+                .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("解析 cell dep 失败: {e}")))?;
+        let header_dep_resolver = DefaultHeaderDepResolver::new(self.rpc_url.as_str());
+        Ok(BuildDeps {
+            cell_collector,
+            cell_dep_resolver,
+            header_dep_resolver,
+            tx_dep_provider,
+        })
+    }
+
+    /// 把地址解析成**标准 secp256k1_blake160 单签**锁脚本。
+    ///
+    /// 领域说明：两段式目前只支持这一种锁，原因很具体——
+    /// `PlaceholderUnlocker` 只认领 args 长度为 20 的锁（见 `tx.rs`）。
+    /// 若发送方是多签锁或 omni-lock，占位 witness 就填不进去，
+    /// 后续 `generate_message` 会因为 witness 数量不足报
+    /// `WitnessNotEnough`——一个完全看不出真实原因的错误。
+    /// 这里提前拦下，直接告诉调用方锁的类型不支持。
+    fn require_sighash_lock(&self, address_raw: &str) -> Result<Script, SdkError> {
+        let (lock, _) = address::decode_address(address_raw)?;
+        let packed = lock_to_packed_script(&lock);
+        let args = packed.args().raw_data();
+        // `hash_type()` 返回 molecule 的 `Byte`（1 字节的 wrapper）。
+        // 用 `as_slice()[0]` 取值，比 `into()` / `unpack()` 都稳：
+        // `Byte` 上有多个 `Into` 实现（`u8`、`DepType`、`ScriptHashType`…），
+        // 写 `into()` 会撞上 E0283「类型无法推断」。
+        let hash_type = packed.hash_type().as_slice()[0];
+        // 三项全中才算标准单签：系统 code_hash、hash_type=type、args 恰好 20 字节。
+        let is_sighash = packed.code_hash().as_slice() == SIGHASH_TYPE_HASH.as_bytes()
+            && hash_type == ScriptHashType::Type as u8
+            && args.len() == crate::tx::LOCK_ARGS_LEN;
+        if !is_sighash {
+            return Err(SdkError::invalid_argument(format!(
+                "CKB 两段式转账目前只支持标准 secp256k1_blake160 单签地址，\
+                 该地址的锁脚本不符合（code_hash 非系统 sighash / hash_type 非 type / args 非 20 字节）: {address_raw}"
+            )));
+        }
+        Ok(packed)
+    }
+}
+
+/// `build_deps` 的返回结构。
+///
+/// 语法说明：四个字段都是 ckb-sdk 的具体类型（不是 trait 对象），
+/// 因为 `build_balanced` 的参数分别是 `&mut dyn CellCollector`、
+/// `&dyn CellDepResolver` 等——传具体类型时会自动强转成 trait 对象，
+/// 反过来（trait 对象 → 具体类型）做不到。所以存具体类型更灵活。
+struct BuildDeps {
+    cell_collector: DefaultCellCollector,
+    cell_dep_resolver: DefaultCellDepResolver,
+    header_dep_resolver: DefaultHeaderDepResolver,
+    tx_dep_provider: DefaultTransactionDependencyProvider,
+}
+
+/// 本 crate 的 `LockScript` → ckb-types 的 `packed::Script`。
+///
+/// 两个结构体表达的是同一件事（code_hash + hash_type + args），
+/// 但分属两套类型：`address.rs` 手写编解码用的是定长数组与裸字节，
+/// ckb-sdk 构造交易用的是 molecule 类型。这层转换是两套世界的边界。
+fn lock_to_packed_script(lock: &LockScript) -> Script {
+    Script::new_builder()
+        .code_hash(lock.code_hash.pack())
+        // `hash_type(..)` 的参数是泛型 `T: Into<Byte>`，而 `u8` 本身就有
+        // `Into<Byte>` 实现，直接传裸 `u8` 即可。写成 `.into()` 反而会因
+        // 候选实现过多（`u8` / `DepType` / `ScriptHashType`）触发 E0283。
+        .hash_type(lock.hash_type)
+        .args(Bytes::from(lock.args.clone()).pack())
+        .build()
 }
 
 // trait 实现块：实现之后本类型即可被 `Box<dyn ChainClient>` 持有，
@@ -620,6 +731,281 @@ impl ChainClient for CkbClient {
             "from_script_args": format!("0x{}", hexutil::encode_hex(&sender_blake160)),
         })))
     }
+
+    /// 两段式第一步：构造交易并交出**待签摘要**，私钥不进 SDK。
+    ///
+    /// 领域说明：CKB 的转账无法离线构造——要收集 live cell、算容量平衡与找零、
+    /// 还要按 `cell_dep` 把系统脚本挂上去。这些都得问节点。
+    /// 所以「agent 自己拼交易、只让 SDK 广播」这条路在 CKB 上走不通，
+    /// 必须由 SDK 构造、agent 只负责签那几个 32 字节摘要。
+    ///
+    /// 与 `transfer` 的关系：两者共用 `build_deps` / FEE_RATE / MAX_FEE /
+    /// `CapacityTransferBuilder`，因此同样的输入会产出**同样的交易字节**，
+    /// 区别只在最后由谁签名。
+    ///
+    /// `public_key` 参数对 CKB **不需要**：`from` 地址里已经编码了
+    /// blake160(公钥)，签名则自带 recovery id 让链上反推公钥。
+    /// 交易里既没有公钥字段，也没有 sender 字段。
+    async fn build_transfer(&self, req: BuildTransferRequest) -> Result<BuildTransferView, SdkError> {
+        // 1) 发送方：必须是标准单签锁（见 `require_sighash_lock` 的说明）。
+        let sender_script = self.require_sighash_lock(&req.from)?;
+        let sender_blake160 = sender_script.args().raw_data().to_vec();
+
+        // 2) 接收方：走 ckb-sdk 的官方 bech32 解析，支持全部地址格式。
+        let receiver: Address = req
+            .to
+            .trim()
+            .parse()
+            .map_err(|e| SdkError::invalid_argument(format!("非法 CKB 接收方地址: {e}")))?;
+        let receiver_script = Script::from(&receiver);
+
+        // 3) 金额：统一按人类可读 CKB 解析为 shannon，再收紧到 `u64`（capacity 的上限）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+        let capacity: u64 = amount_raw
+            .try_into()
+            .map_err(|_| SdkError::invalid_argument("CKB 转账金额超出 capacity 上限"))?;
+        if capacity < MIN_SECP_CELL_CAPACITY {
+            return Err(SdkError::invalid_argument(format!(
+                "CKB 单笔转账金额不能低于 {} shannon（约 {} CKB）",
+                MIN_SECP_CELL_CAPACITY,
+                MIN_SECP_CELL_CAPACITY / ONE_CKB
+            )));
+        }
+
+        // 4) 环境依赖（与 `transfer` 完全同源）。
+        let BuildDeps {
+            mut cell_collector,
+            cell_dep_resolver,
+            header_dep_resolver,
+            tx_dep_provider,
+        } = self.build_deps()?;
+
+        // 5) 占位 unlocker。这是两段式与一体式唯一的分岔点：
+        //    一体式这里放 `SecpSighashUnlocker`（持私钥），
+        //    两段式放 `PlaceholderUnlocker`（只填 65 字节零）。
+        let mut unlockers: HashMap<ScriptId, Box<dyn ScriptUnlocker>> = HashMap::default();
+        unlockers.insert(
+            ScriptId::new_type(SIGHASH_TYPE_HASH),
+            Box::new(crate::tx::PlaceholderUnlocker) as Box<dyn ScriptUnlocker>,
+        );
+
+        // 6) 容量平衡器：发送方锁脚本作为 capacity provider。
+        let placeholder_witness = WitnessArgs::new_builder()
+            .lock(Some(Bytes::from(vec![0u8; crate::tx::PLACEHOLDER_LOCK_LEN])).pack())
+            .build();
+        let mut balancer =
+            CapacityBalancer::new_simple(sender_script.clone(), placeholder_witness, FEE_RATE);
+        balancer.set_max_fee(Some(MAX_FEE));
+
+        // 7) 构造「已平衡、已填占位」的交易——**不签名**。
+        let output = CellOutput::new_builder()
+            .lock(receiver_script)
+            .capacity(capacity)
+            .build();
+        let builder = CapacityTransferBuilder::new(vec![(output, Bytes::default())]);
+        let balanced = builder
+            .build_balanced(
+                &mut cell_collector,
+                &cell_dep_resolver,
+                &header_dep_resolver,
+                &tx_dep_provider,
+                &balancer,
+                &unlockers,
+            )
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("构建 CKB 交易失败: {e}")))?;
+
+        // 8) 分组 → 待签摘要。
+        //
+        // `gen_script_groups` 会逐个 input 回溯前序交易，取回被花费 cell 的
+        // lock script，据此把 input 分组成若干 lock group。
+        // 每个 group 有自己的摘要（见 `tx.rs` 模块文档）。
+        let ScriptGroups { lock_groups, .. } = gen_script_groups(&balanced, &tx_dep_provider)
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("分析 lock group 失败: {e}")))?;
+
+        // 排序！`lock_groups` 是 `HashMap`，迭代顺序**不确定**。
+        // 上下文要跨进程传给 agent，签名顺序必须与组序严格对应，
+        // 所以按 `input_indices[0]` 升序固定下来——
+        // 这个顺序恰好也是 witness 在交易里的顺序，最自然。
+        let mut groups: Vec<_> = lock_groups.into_values().collect();
+        groups.sort_by_key(|g| g.input_indices.first().copied().unwrap_or(usize::MAX));
+
+        let sign_groups = groups
+            .iter()
+            .map(|g| crate::tx::to_sign_group(&balanced, g))
+            .collect::<Result<Vec<_>, SdkError>>()?;
+        if sign_groups.is_empty() {
+            return Err(SdkError::new(
+                ErrorCode::RpcError,
+                "构造出的交易没有任何 lock group，无法签名（发送方 cell 收集失败？）",
+            ));
+        }
+
+        // 9) 打包上下文。交易哈希**不含 witness**，所以现在算出的
+        //    就是最终上链的那个哈希，可以先回显给调用方对账。
+        let tx_hash = format!("0x{:x}", balanced.hash());
+        let context = crate::tx::SubmitContext {
+            network: self.network.clone(),
+            tx_hex: crate::tx::encode_transaction(&balanced),
+            tx_hash: tx_hash.clone(),
+            groups: sign_groups.clone(),
+            from: req.from.clone(),
+            to: req.to.clone(),
+            amount_shannon: amount_raw.to_string(),
+        };
+        let context_json = serde_json::to_value(&context).map_err(|e| {
+            SdkError::new(ErrorCode::ParseError, format!("序列化转账上下文失败: {e}"))
+        })?;
+
+        let json_tx = JsonTransactionView::from(balanced.clone());
+        Ok(BuildTransferView::new(
+            ChainKind::Ckb,
+            &self.network,
+            req.from,
+            req.to,
+            amount_raw,
+            // `unsigned_tx_hex`：交易的 molecule 字节，是 CKB 交易的规范二进制形态。
+            crate::tx::encode_transaction(&balanced),
+            // 只有一个 group 时给单值，多个时给数组——
+            // 让常见场景（单签账户）的调用方不必处理数组。
+            hexutil::encode_hex_prefixed(&crate::tx::decode_digest_hex(
+                &sign_groups[0].signing_digest,
+            )?),
+            "secp256k1",
+            "blake2b-256",
+        )
+        .with_extra(json!({
+            "tx_hash": tx_hash,
+            // 待签摘要数组：每个 lock group 一个，顺序与 `submit_tx` 的
+            // `signatures` 数组一一对应。
+            "signing_payloads": sign_groups.iter().map(|g| g.signing_digest.clone()).collect::<Vec<_>>(),
+            "group_count": sign_groups.len(),
+            "signature_encoding": "recoverable-rs-hex",
+            "signature_length": crate::tx::SIGNATURE_LEN,
+            "recovery_id_range": format!("0..={}", crate::tx::MAX_RECOVERY_ID),
+            "sighash_algorithm": "blake2b-256(tx_hash || witness_layout)",
+            "note": "CKB 的待签摘要不依赖锁脚本本身，只依赖交易哈希与各 witness 的布局；签名是 65 字节可恢复签名，recovery id 不加 27。",
+            "inputs": json_tx.inner.inputs.len(),
+            "outputs": json_tx.inner.outputs.len(),
+            "cell_deps": json_tx.inner.cell_deps.len(),
+            "from_script_args": hexutil::encode_hex_prefixed(&sender_blake160),
+            "submit_context": context_json,
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 两段式第二步：验签 → 回填签名 → 广播。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        // 1) 上下文是必需的：没有它就无法知道签名要写进哪个 witness。
+        let context_value = req.context.clone().ok_or_else(|| {
+            SdkError::invalid_argument(
+                "CKB 提交需要 build_transfer 返回的 submit_context（它记录了每个 lock group 的输入下标）",
+            )
+        })?;
+        let context: crate::tx::SubmitContext = serde_json::from_value(context_value).map_err(|e| {
+            SdkError::invalid_argument(format!("submit_context 不是合法的 CKB 上下文: {e}"))
+        })?;
+
+        // 2) 跨网络护栏。
+        //
+        // 为什么必须由 SDK 来拦：CKB 主网与测试网的**交易字节与签名算法完全相同**，
+        // 唯一区别是系统脚本的 code_hash 与 cell dep（以及地址前缀 f/t）。
+        // 一笔为测试网构造的交易在主网上不是「无效」，而是「指向了不存在的 cell」，
+        // 节点会报找不到 input——调用方很难把它和「网络配错了」联系起来。
+        if context.network != self.network {
+            return Err(SdkError::invalid_argument(format!(
+                "上下文来自网络 {}，当前客户端连接的是 {}，拒绝提交",
+                context.network, self.network
+            )));
+        }
+
+        // 3) 还原交易并做哈希自检（拦截上下文被篡改）。
+        let unsigned = crate::tx::rebuild_transaction(&context)?;
+
+        // 4) 签名数量必须与 group 数量**精确相等**。
+        //
+        // 用 `!=` 而不是 `<`：多给签名往往意味着调用方误解了分组，
+        // 与其静默忽略多余的，不如明确报错。
+        let signatures = req.signatures.clone().unwrap_or_default();
+        if signatures.len() != context.groups.len() {
+            return Err(SdkError::invalid_argument(format!(
+                "签名数量({})与 lock group 数量({})不一致；每个 lock group 需要恰好一个 65 字节签名",
+                signatures.len(),
+                context.groups.len()
+            )));
+        }
+
+        // 5) 逐个 group：解析 → 重算摘要 → 验签 → 回填。
+        //
+        // 注意摘要是**用当前交易重算**的，不直接采信上下文里记的那份。
+        // 这样即使上下文的 `signing_digest` 字段被改过，
+        // 也不会影响验签结果（只会在下面第 6 步暴露不一致）。
+        let mut tx = unsigned.clone();
+        for (index, group) in context.groups.iter().enumerate() {
+            let signature = crate::tx::parse_signature(&signatures[index])?;
+            let script_group = crate::tx::rebuild_script_group(group)?;
+            let digest = crate::tx::group_signing_digest(&unsigned, &script_group)?;
+
+            // 上下文与交易是否对得上？不一致说明二者被分别改过。
+            let recorded = crate::tx::decode_digest_hex(&group.signing_digest)?;
+            if recorded != digest {
+                return Err(SdkError::invalid_argument(format!(
+                    "第 {index} 个 lock group 的摘要与交易不匹配：上下文记的是 {}，\
+                     由交易重算出的是 0x{}",
+                    group.signing_digest,
+                    hexutil::encode_hex(&digest)
+                )));
+            }
+
+            // 验签：恢复公钥 → blake160 → 与该 group 锁脚本的 args 比对。
+            let lock_args = script_group.script.args().raw_data();
+            crate::tx::verify_signature(&digest, &signature, &lock_args)?;
+
+            // 回填（覆盖式，见 `fill_signature` 的注释）。
+            tx = crate::tx::fill_signature(&tx, &script_group, &signature)?;
+        }
+
+        // 6) 广播前最后一次自检：交易哈希不能变。
+        //
+        // 签名只改 witness，而 CKB 的交易哈希不含 witness，
+        // 所以填完签名后哈希必须与构造时一致。变了就说明中间逻辑有问题。
+        let final_hash = format!("0x{:x}", tx.hash());
+        if !final_hash.eq_ignore_ascii_case(&context.tx_hash) {
+            return Err(SdkError::new(
+                ErrorCode::ParseError,
+                format!(
+                    "回填签名后交易哈希发生了变化（{} → {final_hash}），\
+                     这通常意味着 witness 被写到了错误的位置",
+                    context.tx_hash
+                ),
+            ));
+        }
+
+        // 7) 广播。
+        //
+        // 先取计数再广播：`send_transaction` 会**吃掉** `json_tx.inner`
+        // （按值传参），之后再读 `json_tx.inner` 就是「使用已移动的值」（E0382）。
+        // 把长度提前存下来，是最省事的规避方式。
+        let json_tx = JsonTransactionView::from(tx);
+        let n_inputs = json_tx.inner.inputs.len();
+        let n_outputs = json_tx.inner.outputs.len();
+        let ckb_client = CkbRpcClient::new(self.rpc_url.as_str());
+        let hash = ckb_client
+            .send_transaction(json_tx.inner, Some(OutputsValidator::Passthrough))
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("广播 CKB 交易失败: {e}")))?;
+        let broadcast_hash = format!("0x{}", hexutil::encode_hex(hash.as_bytes()));
+
+        Ok(
+            SubmitView::new(ChainKind::Ckb, &self.network, broadcast_hash.clone()).with_extra(
+                json!({
+                    "tx_hash": broadcast_hash,
+                    "local_hash_matches_broadcast": broadcast_hash == final_hash,
+                    "groups": context.groups.len(),
+                    "outputs": n_outputs,
+                    "inputs": n_inputs,
+                }),
+            ),
+        )
+    }
 }
 
 /// `hash_type` 数值 → CKB JSON-RPC 要求的字符串。
@@ -696,6 +1082,13 @@ fn validate_txid(raw: &str) -> Result<(), SdkError> {
 }
 
 /// 判断 `raw` 是否形如 `0x` + 64 位十六进制（即区块哈希/交易哈希）。
+///
+/// 语法说明：`#[cfg(test)]` 让这个函数**只在测试构建里存在**。
+/// 目前只有单元测试用它；若不标注，正式构建会报
+/// `function is_txid_hex is never used` 的 dead_code 警告。
+/// 与其加 `#[allow(dead_code)]` 掩盖，不如如实声明它属于测试范畴——
+/// 将来正式代码真要用到，去掉这一行即可。
+#[cfg(test)]
 fn is_txid_hex(raw: &str) -> bool {
     // `strip_prefix("0x").is_some_and(|b| ..)`：
     // 先剥前缀（失败即 `None`），再用闭包判断主体是否合规，

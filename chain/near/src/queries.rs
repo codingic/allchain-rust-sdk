@@ -30,7 +30,7 @@ use near_jsonrpc_primitives::types::transactions::TransactionInfo;
 // `BlockId` / `BlockReference` / `Finality` 三件套：描述「查哪个区块」；
 // `FunctionArgs` 是合约调用参数的包装类型；`AccountId` 是**具名账户**的字符串包装。
 use near_primitives::types::{AccountId, BlockId, BlockReference, Finality, FunctionArgs};
-use near_primitives::views::{QueryRequest, TxExecutionStatus};
+use near_primitives::views::{AccessKeyList, QueryRequest, TxExecutionStatus};
 
 use crate::units::format_near;
 
@@ -181,16 +181,74 @@ pub async fn balance(client: &JsonRpcClient, account_id: &AccountId) -> Result<(
     Ok(())
 }
 
+/// `query / view_access_key` 的**数据层**版：只取 nonce，不打印。
+///
+/// 为什么把它从 `view_access_key` 里拆出来：那条路径会 `println!`，
+/// 在 CLI 下是想要的行为，但在 HTTP / MCP 长驻服务里会把日志写进 stdout、
+/// 污染 JSON-RPC 的 stdio 通道。无私钥构造流程（`transactions::build_unsigned_transfer`）
+/// 走的正是服务侧路径，所以这里必须有一个干净版本。
+///
+/// 领域说明：NEAR 的 nonce 是**每把 access key 独立**递增的，不是每个账户一个
+/// （这与 EVM 的账户 nonce 完全不同）。因此查询参数是「账户 + 公钥」二元组，
+/// 少给公钥就无从谈起 nonce。
+pub async fn fetch_access_key_nonce(
+    client: &JsonRpcClient,
+    account_id: &AccountId,
+    public_key: &PublicKey,
+) -> Result<u64> {
+    let response = client
+        .call(methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: QueryRequest::ViewAccessKey {
+                account_id: account_id.clone(),
+                public_key: public_key.clone(),
+            },
+        })
+        .await
+        .with_context(|| format!("查询 access key 失败: {account_id} / {public_key}"))?;
+
+    match response.kind {
+        // `view.nonce` 是「已用掉的最后一个 nonce」，下一笔要用它 +1。
+        QueryResponseKind::AccessKey(view) => Ok(view.nonce),
+        other => bail!("非预期的 RPC 响应类型: {other:?}"),
+    }
+}
+
+/// `query / view_access_key_list`：列出账户名下**所有** access key。
+///
+/// 领域说明——无私钥流程为什么需要它：
+/// 交易体里的 `public_key` 字段必须写实，而调用方（agent）没给公钥时，
+/// 只能由我们查链。若账户名下恰好只有一把 **full access** key，就可以安全地替它选；
+/// 多把时无法猜测 agent 手里握的是哪一把私钥，必须报错让其显式指定。
+pub async fn fetch_access_key_list(
+    client: &JsonRpcClient,
+    account_id: &AccountId,
+) -> Result<AccessKeyList> {
+    let response = client
+        .call(methods::query::RpcQueryRequest {
+            block_reference: BlockReference::Finality(Finality::Final),
+            request: QueryRequest::ViewAccessKeyList {
+                account_id: account_id.clone(),
+            },
+        })
+        .await
+        .with_context(|| format!("查询 access key 列表失败: {account_id}"))?;
+
+    match response.kind {
+        QueryResponseKind::AccessKeyList(list) => Ok(list),
+        other => bail!("非预期的 RPC 响应类型: {other:?}"),
+    }
+}
+
 /// `query / view_access_key`：查询指定公钥的 nonce 与权限（转账前确认 key 有效）。
 ///
-/// 除了打印，它还**返回 nonce**——调用方（transactions.rs）要用「当前 nonce + 1」
-/// 来构造下一笔交易。这是「一个函数兼顾展示与取值」的取舍：
-/// 为了不再多一次 RPC 往返，就让打印与取值合并。
+/// **CLI 直调版**：在 [`fetch_access_key_nonce`] 的基础上补上打印。
 pub async fn view_access_key(
     client: &JsonRpcClient,
     account_id: &AccountId,
     public_key: &PublicKey,
 ) -> Result<u64> {
+    // 先取数（不打印），再打印——逻辑只存在一份，不会两边走偏。
     let response = client
         .call(methods::query::RpcQueryRequest {
             block_reference: BlockReference::Finality(Finality::Final),

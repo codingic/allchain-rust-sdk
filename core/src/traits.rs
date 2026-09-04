@@ -10,8 +10,8 @@ use async_trait::async_trait;
 
 // 从 crate 根一次性引入模型与错误类型（这些类型在 lib.rs 里已重导出）。
 use crate::{
-    AddressView, BalanceView, BlockView, ChainKind, SdkError, StatusView, TransferRequest,
-    TransferView, TxView,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainKind,
+    SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest, TransferView, TxView,
 };
 
 /// 一条链的最小可用能力集。
@@ -136,6 +136,46 @@ pub trait ChainClient: Send + Sync {
         let _ = req;
         Err(SdkError::unsupported(format!(
             "{} 尚不支持转账",
+            self.kind()
+        )))
+    }
+
+    /// 「无私钥」转账构造：仅凭 `from` / `to` / `amount` 组装未签名交易并返回待签对象。
+    ///
+    /// 领域说明——与 [`Self::transfer`] 的分工：
+    /// - `transfer` 是**一体式**：需要 `private_key`，包办构造 + 签名 + 广播；
+    /// - `build_transfer` 是**两段式的第一阶段**：**不接收私钥**，只构造。
+    ///   私钥留在调用方（agent）手里，SDK 拿到链上状态后返回未签名交易与待签对象，
+    ///   由 agent 签名，再经 [`Self::submit_tx`] 广播。
+    ///
+    /// 为什么必须这样拆：构造交易**必须**依赖链上状态（nonce / gas / 最近 blockhash /
+    /// UTXO 等），agent 离线构造不出来；而私钥一旦交给 SDK 就多一处泄漏面。
+    ///
+    /// 返回的 `signing_payload_hex` 是**真正要签的那段字节**，它与 `unsigned_tx_hex`
+    /// 在多数链上并不相同（详见 `BuildTransferView` 的文档），调用方不应自行推导。
+    /// 默认返回 `UNSUPPORTED`，由支持的链覆写。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        let _ = req;
+        Err(SdkError::unsupported(format!(
+            "{} 尚不支持无私钥构造转账",
+            self.kind()
+        )))
+    }
+
+    /// 广播一笔**调用方已签名**的交易（`build_transfer` 的第二阶段）。
+    ///
+    /// 领域说明：只接收签完名的交易字节，不接触任何私钥。与 `build_transfer`
+    /// 配对，构成「SDK 构造 → agent 签名 → SDK 广播」的闭环。
+    ///
+    /// 注意 AR 也支持本方法：它虽然无法**无私钥构造**（需要 RSA 公钥模数），
+    /// 但广播本身不需要私密材料，调用方用别的方式签出的交易同样可以提交。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        let _ = req;
+        Err(SdkError::unsupported(format!(
+            "{} 尚不支持广播已签名交易",
             self.kind()
         )))
     }

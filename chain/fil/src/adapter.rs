@@ -24,8 +24,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil, parse_units,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest,
+    TransferView, TxStatus, TxView, hexutil, parse_units,
 };
 // `chain_rpcutil` 是被各新链共用的 HTTP/JSON-RPC 工具层。
 // 这里只取用四个：`Http`（客户端）、`field_u64`（取 u64 字段）、`loose_u128`/`loose_u64`（宽松解析大整数）。
@@ -525,6 +526,152 @@ impl ChainClient for FilClient {
             "gas_estimated": gas_estimated,
         })))
     }
+
+    /// **无私钥**构造转账：取 nonce → 估 gas → 算 CID 与待签摘要 → 交回调用方。
+    ///
+    /// 与 [`Self::transfer`] 的分工：
+    /// - `transfer` 是**一体式**——私钥进 SDK，签名与广播都在 SDK 内完成；
+    /// - `build_transfer` 是**两段式**的第一段——SDK 只负责构造，
+    ///   签名交给调用方（agent）用自己的私钥做，私钥从不进入本进程。
+    ///
+    /// 领域说明——为什么 FIL **不需要** `public_key`：
+    /// 账户地址就是公钥的哈希，但构造消息时**用不到公钥**——
+    /// 消息里只放地址，公钥由签名携带（recovery id 反推）。
+    /// 于是这里只校验 `from` 是合法地址，至于调用方是否真的拥有它，
+    /// 留到广播阶段由 [`crate::tx::verify_signature`] 用签名证明。
+    /// 这与 BTC 不同：BTC 的见证里必须显式放公钥，所以那边必填。
+    async fn build_transfer(&self, req: BuildTransferRequest) -> Result<BuildTransferView, SdkError> {
+        // 金额：人类可读 FIL → attoFIL（18 位小数）。
+        let amount_raw = parse_units(&req.amount, self.kind().decimals())?;
+
+        let built =
+            crate::tx::assemble_unsigned(&self.http, &req.from, &req.to, amount_raw).await?;
+
+        let context = crate::tx::build_context(&self.network, &built.message)?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Fil,
+            &self.network,
+            req.from,
+            req.to,
+            amount_raw,
+            // 未签名消息体（DAG-CBOR 字节）的十六进制。
+            crate::tx::encode_message(&built.message)?,
+            // **真正要签的是 32 字节摘要**，不是上面的消息字节、也不是 CID 字符串。
+            hexutil::encode_hex_prefixed(&built.signing_digest),
+            "secp256k1",
+            // payload 已经是最终摘要（blake2b-256 的结果），不要再哈希。
+            "none",
+        )
+        .with_extra(json!({
+            "cid": built.cid,
+            "nonce": built.nonce,
+            "gas_estimated": built.gas_estimated,
+            "gas_limit": built.message.gas_limit,
+            "gas_fee_cap": built.message.gas_fee_cap.atto().to_string(),
+            "gas_premium": built.message.gas_premium.atto().to_string(),
+            // —— 调用方指引 ——
+            "signature_encoding": "recoverable-rs-hex",
+            "signature_length": crate::tx::SIGNATURE_LEN,
+            "recovery_id_range": "0..=3（Filecoin 不加 27）",
+            "sighash_algorithm": "blake2b-256(cid_bytes_of_dagcbor_message)",
+            "message_hex_encoding": "dag-cbor",
+            // —— 广播阶段要原样回传 ——
+            "submit_context": context,
+            "note": "请用 secp256k1 对 signing_payload_hex 做**可恢复**签名，产出 65 字节 r||s||v；\
+                     把签名放进 SubmitRequest.signatures[0]，并把 submit_context 原样放进 SubmitRequest.context，\
+                     再调用 submit_tx。signed_tx_hex 在 FIL 上不使用（留空即可）。",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易。FIL 收的是**单个签名 + 上下文**，不是拼好的交易字节。
+    ///
+    /// 领域说明——为什么不让 agent 直接拼 `SignedMessage` JSON：
+    /// 让它自己组装，就得把 Lotus 的字段命名（首字母大写）、
+    /// 金额的字符串化、签名的 base64 编码全抄一遍。
+    /// 任一处出错，节点返回的是 `invalid signature` 或 `malformed message`，
+    /// 不会指出具体哪个字段。所以这里只收 65 字节签名，由 SDK 组装并验签。
+    ///
+    /// 参数约定：
+    /// - `signatures`：**恰好一个** 65 字节可恢复签名（十六进制），`v` 取 0..=3；
+    /// - `context`：`build_transfer` 下发的 `extra.submit_context`，原样回传；
+    /// - `signed_tx_hex`：FIL **不使用**（设为 `""` 即可）——最终消息由 SDK 组装。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+        if encoding != "hex" {
+            return Err(SdkError::invalid_argument(format!(
+                "FIL 签名只接受 hex 编码，收到 {encoding}"
+            )));
+        }
+
+        let context_value = req.context.ok_or_else(|| {
+            SdkError::invalid_argument(
+                "FIL 广播必须回传 build_transfer 下发的 extra.submit_context：\
+                 消息体（含 gas 三元组与 nonce）不在签名里，缺了它无法重组 SignedMessage",
+            )
+        })?;
+        let context: crate::tx::SubmitContext = serde_json::from_value(context_value)
+            .map_err(|e| SdkError::invalid_argument(format!("submit_context 解析失败: {e}")))?;
+
+        // 跨网护栏：主网与测试网的地址前缀不同（f / t），
+        // 但**同一份字节在两条链上都能验签通过**——
+        // 链本身不校验网络，所以这一步必须在广播前由 SDK 拦住。
+        if context.network != self.network {
+            return Err(SdkError::invalid_argument(format!(
+                "网络不匹配：该上下文是在 {} 构造的，当前客户端是 {}",
+                context.network, self.network
+            )));
+        }
+
+        let raw_signatures = req.signatures.ok_or_else(|| {
+            SdkError::invalid_argument(
+                "FIL 广播需要 signatures 数组：请放入一个 65 字节可恢复签名（r||s||v，v 取 0..=3）",
+            )
+        })?;
+        if raw_signatures.len() != 1 {
+            return Err(SdkError::invalid_argument(format!(
+                "FIL 一笔交易只需一个签名，收到 {} 个",
+                raw_signatures.len()
+            )));
+        }
+        let signature = crate::tx::parse_signature(&raw_signatures[0])?;
+
+        // 重建消息（内含 CID 自检），再验签（恢复公钥 → 派生地址 → 与 from 比对）。
+        let message = crate::tx::rebuild_message(&context)?;
+        let recovered = crate::tx::verify_signature(&context, &signature)?;
+        let signed_json = crate::tx::signed_message_json(&message, &signature);
+
+        // 广播是唯一**不可逆**的操作，前面所有校验都是为了走到这里时已万无一失。
+        let resp = self
+            .http
+            .jsonrpc("Filecoin.MpoolPush", json!([signed_json]))
+            .await
+            .map_err(|e| SdkError::new(ErrorCode::RpcError, format!("广播 FIL 交易失败: {e}")))?;
+
+        // Lotus 把返回的消息 CID 序列化成 IPLD 链接 `{"/": "bafy..."}`。
+        // 本地已算出相同的 CID，取回的那个仅作回显佐证。
+        let node_cid: Option<String> = resp.get("/").and_then(Value::as_str).map(str::to_string);
+        let cid = crate::tx::message_cid(&message)?.to_string();
+
+        Ok(SubmitView::new(ChainKind::Fil, &self.network, cid.clone()).with_extra(json!({
+            "broadcast": true,
+            "cid": cid,
+            "node_cid": node_cid,
+            // 节点返回的 CID 应与本地算出的一致；不一致说明数据源做了非预期处理。
+            "cid_matches_local": node_cid.as_deref() == Some(cid.as_str()),
+            "from": recovered,
+            "to": context.to,
+            "quantity_atto": context.quantity_atto,
+            "nonce": context.nonce,
+            "gas_limit": context.gas_limit,
+        })))
+    }
 }
 
 /// 由 32 字节 hex 私钥派生 secp256k1 签名密钥与 f1 发送方地址。
@@ -574,7 +721,11 @@ fn blake2b_256(data: &[u8]) -> [u8; 32] {
 }
 
 /// 取发送方下一笔消息的 nonce（`MpoolGetNonce`）。
-async fn get_nonce(http: &Http, from: &str) -> Result<u64, SdkError> {
+///
+/// 声明为 `pub(crate)` 供 `crate::tx` 的两段式构造复用——
+/// nonce 是链上状态，两段式与一体式必须取到同一个值，
+/// 让两者共用这一个函数比各写一份更可靠。
+pub(crate) async fn get_nonce(http: &Http, from: &str) -> Result<u64, SdkError> {
     let v = http.jsonrpc("Filecoin.MpoolGetNonce", json!([from])).await?;
     loose_u64(&v)
         .map_err(|_| SdkError::new(ErrorCode::ParseError, format!("解析 nonce 失败: {v}")))
@@ -583,9 +734,9 @@ async fn get_nonce(http: &Http, from: &str) -> Result<u64, SdkError> {
 /// 估算 gas：把 gas 全置 0 的模板消息交给 `GasEstimateMessageGas`，
 /// 取回填充好的 `GasLimit` / `GasFeeCap` / `GasPremium`。
 ///
-/// 返回 `true` 表示估算成功；节点不支持或报错时回退保守默认（`GasLimit = 2_000_000`），
-/// 此时返回 `false`（dry-run 友好，但广播可能被节点以费率不足拒绝）。
-async fn estimate_gas(http: &Http, msg: &mut Message) -> bool {
+/// 声明为 `pub(crate)` 的理由同 `get_nonce`：gas 三元组直接参与 CID，
+/// 两条路径若用了不同的估算逻辑，同一笔转账会算出两份不同的字节。
+pub(crate) async fn estimate_gas(http: &Http, msg: &mut Message) -> bool {
     let template = message_to_lotus_json(msg);
     match http
         .jsonrpc(

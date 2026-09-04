@@ -33,6 +33,11 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 // 密钥对类型：内部持有 32 字节种子，公钥由种子推导而来。
 use solana_keypair::Keypair;
+// `Message` 是「账户表 + 指令列表」的编译结果，`serialize()` 产出的线格式字节
+// 就是 ed25519 真正签名作用其上的内容。
+use solana_message::Message;
+// `Hash` 即 32 字节 blockhash，Solana 用它替代 nonce 做防重放。
+use solana_hash::Hash;
 // `Pubkey`：32 字节公钥的**可复制**包装类型（实现了 `Copy`），`Display` 即 base58 地址。
 use solana_pubkey::Pubkey;
 // 同步阻塞的 JSON-RPC 客户端（阻塞语义见 cluster.rs 的说明）。
@@ -198,6 +203,122 @@ pub fn build_signed_transfer(
         lamports,
         recent_blockhash: blockhash.to_string(),
     })
+}
+
+/// **无私钥**构造出的一笔转账：待签消息 + 待组装的未签名交易。
+///
+/// 领域说明（Solana 的两个「不同字节串」，务必分清）：
+/// - `signing_payload` = `Message::serialize()`，即线格式消息。
+///   它是 **ed25519 真正作用其上的字节**——Solana 不做二次哈希，
+///   直接对这串字节签名（ed25519 内部自带 SHA-512 摘要）。
+/// - `unsigned_tx`     = bincode 序列化的 `Transaction`，其 `signatures[0]`
+///   是一段**全零占位**。它比消息多一层外壳（签名槽位），
+///   是签名方「把签名填回去」所需的基底。
+///
+/// 两者是**包含关系**而非相等关系：签名方拿到 `unsigned_tx` 后，
+/// 从中取出 message 序列化得 `signing_payload`，签名，再把签名写回 `signatures[0]`。
+/// 因此我们必须两个都交出去，否则签名方无法闭环。
+pub struct UnsignedTransfer {
+    /// bincode 序列化的未签名 `Transaction`（带全零占位签名），十六进制。
+    ///
+    /// 与 `../sign` 程序 `signtx(chaintype="sol")` 的输入格式一致：
+    /// 那边用 `bincode::deserialize::<Transaction>` 解它，两者互为逆运算。
+    pub unsigned_tx_hex: String,
+    /// 真正要签的字节：`Message::serialize()`，十六进制。
+    pub signing_payload_hex: String,
+    /// 交易锚定的近期 blockhash（防重放，有效期约 150 个块）。
+    pub recent_blockhash: String,
+    /// 付款方公钥（base58）。
+    pub from: Pubkey,
+    /// 收款方公钥（base58）。
+    pub to: Pubkey,
+    /// 转账金额，单位 lamport。
+    pub lamports: u64,
+}
+
+/// 由 blockhash 组装出待签交易。**纯函数，不访问网络**。
+///
+/// 与「联网取 blockhash」拆开，是为了让最有业务风险的一步（消息编译、
+/// 待签字节口径、交易外壳序列化）变成**可离线测试**的——
+/// 否则要测它就得连公共 RPC，网络抖动会变成假失败。
+fn assemble_unsigned(
+    blockhash: Hash,
+    from: &Pubkey,
+    to: &Pubkey,
+    lamports: u64,
+) -> Result<UnsignedTransfer> {
+    let instruction = transfer(from, to, lamports);
+
+    // 必须用 `new_with_blockhash` 而不是 `new`——这是一个**真实踩过的坑**：
+    // `Message::new` 产出的 message 里 `recent_blockhash` 是**全零占位**，
+    // blockhash 直到 `Transaction::sign` 时才被写进去。
+    // 于是若这里用 `new`，我们交出去的待签字节锚定的是零 blockhash，
+    // 而 `recent_blockhash` 字段却报着真实值——两者不一致。
+    // 其后果是：调用方签出来的交易对一个「零 blockhash」的消息签名，
+    // 节点会以 BlockhashNotFound 拒绝，而本地怎么自测都发现不了
+    // （签名对任何字节都成立）。这正是测试
+    // `signing_payload_matches_official_signing_path` 要防的事。
+    let message = Message::new_with_blockhash(&[instruction], Some(from), &blockhash);
+    // 真正要签的字节。**不要**换成 serde/bincode 编码——
+    // 虽然 `ShortVec` 的 serde 实现恰好与线格式一致（见 ../sign 的测试），
+    // 但 `serialize()` 才是官方 `Transaction::try_partial_sign` 内部用的那一个，
+    // 语义明确且不依赖 serde feature。
+    let signing_payload = message.serialize();
+
+    // `new_unsigned` 会按 `num_required_signatures` 生成对应个数的**全零占位签名**。
+    // 这正是各钱包适配器之间交换「待签交易」的通用形态。
+    let tx = Transaction::new_unsigned(message);
+    let unsigned_tx =
+        bincode::serialize(&tx).context("序列化未签名交易失败（需 solana-transaction 的 serde feature）")?;
+
+    Ok(UnsignedTransfer {
+        unsigned_tx_hex: format!("0x{}", hex::encode(&unsigned_tx)),
+        signing_payload_hex: format!("0x{}", hex::encode(&signing_payload)),
+        recent_blockhash: blockhash.to_string(),
+        from: *from,
+        to: *to,
+        lamports,
+    })
+}
+
+/// **无私钥**构造一笔转账：取最新 blockhash、组装指令，产出待签消息与未签名交易。
+///
+/// 与 [`build_signed_transfer`] 的关系：后者多走一步本地签名，
+/// 本函数则停在「待签」处，把字节交给调用方——私钥不进入本进程。
+///
+/// 领域说明：`from` 在这里只用于**构造指令**（SystemProgram.transfer 需要付款方账户）
+/// 与充当 fee payer，**不做任何权限校验**。无私钥就无法证明调用方拥有该地址；
+/// 安全性由签名环节保障：没有私钥就签不出节点能接受的签名。
+pub fn build_unsigned_transfer(
+    client: &RpcClient,
+    from: &Pubkey,
+    to: &Pubkey,
+    lamports: u64,
+) -> Result<UnsignedTransfer> {
+    // 联网取 blockhash：Solana 用它替代 nonce 做防重放，
+    // 锚定的 blockhash 若早于最近 150 个块，节点会直接拒绝。
+    // 这是本函数唯一需要联网的一步，也是「无法完全离线构造」的原因。
+    let blockhash = client
+        .get_latest_blockhash()
+        .context("获取最新 blockhash 失败")?;
+    assemble_unsigned(blockhash, from, to, lamports)
+}
+
+/// 广播**已签名**的交易字节，返回签名（Solana 里签名即 txid）。
+///
+/// 领域说明：与 ETH 不同，Solana 的交易标识不是哈希而是**签名本身**——
+/// 因为签名是确定性的，同一笔交易签名唯一，天然可作标识。
+///
+/// 本函数只做 `send_transaction`，**不等待确认**。
+/// 广播成功 ≠ 落块：交易可能因 blockhash 过期或余额不足而被丢弃，
+/// 要确认结果请用 `tx()` 查签名状态。
+pub fn broadcast_raw(client: &RpcClient, raw: &[u8]) -> Result<solana_signature::Signature> {
+    // 先反序列化成 `Transaction`：这一步顺带校验字节结构是否合法，
+    // 畸形输入会在本地报错，而不是发出一个注定被拒的请求。
+    let tx: Transaction = bincode::deserialize(raw).context("解析已签名交易失败")?;
+    client
+        .send_transaction(&tx)
+        .context("广播交易失败（blockhash 可能已过期，或账户余额不足）")
 }
 
 /// 转账：构造 SystemProgram.transfer 指令 -> 用最新 blockhash 签名 -> 广播并等待确认。
@@ -437,6 +558,113 @@ mod tests {
             keypair_from_bytes(&full[..32]).is_err(),
             "截断到 32 字节应报错"
         );
+    }
+
+    // ---- 无私钥构造（`build_transfer` 的底座）----
+    //
+    // 与 ETH 的做法一致：断言只基于 `assemble_unsigned` **真正交出去的字符串**，
+    // 不在测试里重算序列化。判据则取自**官方签名路径**——
+    // 我们声称的待签字节，必须让「手动签名」与「官方 tx.sign()」得到同一个签名。
+
+    /// 用固定 blockhash 与确定性地址组装，绕开网络。
+    fn fixed_unsigned() -> UnsignedTransfer {
+        assemble_unsigned(
+            Hash::new_from_array([0x5c; 32]),
+            &Pubkey::new_from_array([0x11; 32]),
+            &Pubkey::new_from_array([0x22; 32]),
+            1_000_000,
+        )
+        .expect("固定输入应能组装成功")
+    }
+
+    /// 剥掉 `0x` 前缀后解出字节。
+    fn decode_prefixed(raw: &str) -> Vec<u8> {
+        hex::decode(raw.trim_start_matches("0x")).expect("应为合法十六进制")
+    }
+
+    /// 交出去的待签字节，必须与**官方签名路径**签的是同一串。
+    ///
+    /// 判据的构造方式（关键）：
+    ///   1. 走官方 `Transaction::sign`，得到 `official_sig`；
+    ///   2. 手动对我们自己声明的 `signing_payload_hex` 做 ed25519 签名，得到 `manual_sig`；
+    ///   3. 两者必须相等。
+    ///
+    /// 若我们交出去的字节串有任何偏差（少了类型标志、字段顺序错、多算了哈希…），
+    /// 两个签名会立刻分叉。这比「自己再算一遍 keccak/序列化」强得多——
+    /// 那是拿实现验证实现，这里拿的是官方路径作真值。
+    #[test]
+    fn signing_payload_matches_official_signing_path() {
+        let keypair = Keypair::new();
+        // 付款方取真实密钥对的公钥，这样官方签名时签名槽位才对得上。
+        let u = assemble_unsigned(
+            Hash::new_from_array([0x5c; 32]),
+            &keypair.pubkey(),
+            &Pubkey::new_from_array([0x22; 32]),
+            1_000_000,
+        )
+        .expect("应能组装");
+
+        // 路径 A：官方。反序列化我们交出去的交易外壳，再走官方 sign。
+        let mut tx: Transaction =
+            bincode::deserialize(&decode_prefixed(&u.unsigned_tx_hex)).expect("外壳应可被反序列化");
+        // 占位签名必须先被清成全零——这正是「未签名」的应有形态。
+        assert!(
+            tx.signatures[0].as_ref().iter().all(|b| *b == 0),
+            "未签名交易的 signatures[0] 应为全零占位"
+        );
+        let blockhash = Hash::new_from_array([0x5c; 32]);
+        tx.sign(&[&keypair], blockhash);
+        let official_sig = tx.signatures[0];
+
+        // 路径 B：手动对我们声明的待签字节签名。
+        let manual_sig = keypair.sign_message(&decode_prefixed(&u.signing_payload_hex));
+
+        assert_eq!(
+            official_sig.as_ref().to_vec(),
+            manual_sig.as_ref().to_vec(),
+            "声明的待签字节与官方签名路径不一致"
+        );
+    }
+
+    /// 交易外壳必须能被 `bincode::deserialize::<Transaction>` 原样解回。
+    ///
+    /// 这是**跨进程契约**：`../sign` 程序的 `signtx(chaintype="sol")`
+    /// 正是这么解析我们交出去的字节。保留完整往返（解码→重编码→逐字节相等），
+    /// 可同时排除「字段丢失」与「长度前缀写错」两类问题。
+    #[test]
+    fn unsigned_tx_round_trips_through_bincode() {
+        let u = fixed_unsigned();
+        let bytes = decode_prefixed(&u.unsigned_tx_hex);
+
+        let tx: Transaction = bincode::deserialize(&bytes).expect("外壳应可被反序列化");
+        // 解出来的交易，其 message 序列化后必须与声明的待签字节一致——
+        // 这把「外壳」与「待签字节」两者的关系也一并钉住了。
+        assert_eq!(tx.message.serialize(), decode_prefixed(&u.signing_payload_hex));
+        // 重新序列化应与输入逐字节相同（ShortVec 的长度前缀是定长的，故可往返）。
+        assert_eq!(
+            bincode::serialize(&tx).expect("应可序列化"),
+            bytes,
+            "解码后重新序列化应与原字节一致"
+        );
+    }
+
+    /// 待签字节必须以 header + 账户表开头，且第一个账户是付款方（fee payer）。
+    ///
+    /// 领域说明：`Message::new` 会把 fee payer 排在账户表**首位**并标记为需签名；
+    /// 若哪天顺序变了而我们没跟着改，签出来的交易会被节点拒绝。
+    #[test]
+    fn wire_format_starts_with_header_then_fee_payer() {
+        let u = fixed_unsigned();
+        let wire = decode_prefixed(&u.signing_payload_hex);
+
+        // header：1 个必需签名 / 0 个只读签名 / 1 个只读非签名（SystemProgram）。
+        assert_eq!(&wire[..3], &[1, 0, 1]);
+        // account_keys 的 compact-u16 长度 = 3（from / to / system program）。
+        assert_eq!(wire[3], 3);
+        // 第一个账户即 fee payer = 付款方。
+        assert_eq!(&wire[4..36], &[0x11u8; 32]);
+        // 第二个账户是收款方。
+        assert_eq!(&wire[36..68], &[0x22u8; 32]);
     }
 
     /// base58 编解码互为逆运算（针对任意字节序列，不限于 32/64 字节）。

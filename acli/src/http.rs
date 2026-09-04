@@ -100,6 +100,41 @@ struct TransferBody {
     from: Option<String>,
 }
 
+/// `GET /v1/build-transfer` 参数：无私钥构造转账（两段式第一阶段）。
+///
+/// 用 **GET** 而不是 POST 是刻意的：本端点只读取链上状态（nonce / gas / blockhash /
+/// UTXO）并在本地组装交易，**既不广播也不接触私钥**，没有任何副作用，符合 GET 的语义。
+#[derive(Debug, Deserialize)]
+struct BuildTransferParams {
+    #[serde(flatten)]
+    base: BaseParams,
+    /// 付款地址/账户；必填，因为没有私钥可供推导。
+    from: String,
+    to: String,
+    amount: String,
+    /// 签名公钥；NEAR / APT 等多密钥账户需要，AR 必填。
+    public_key: Option<String>,
+}
+
+/// `POST /v1/submit-tx` 请求体：广播已签名交易（两段式第二阶段）。
+///
+/// 与 `TransferBody` 同样刻意**扁平**：客户端直接按字段名 POST，不必多嵌一层。
+/// 注意这里**没有任何私钥字段**——第二阶段只接收签完名的字节。
+#[derive(Debug, Deserialize)]
+struct SubmitTxBody {
+    chain: String,
+    network: Option<String>,
+    rpc_url: Option<String>,
+    /// 已签名交易的十六进制（`encoding` 为 `base64` 时是 base64 串）。
+    signed_tx_hex: String,
+    /// 编码：`hex`（缺省）或 `base64`。
+    encoding: Option<String>,
+    /// 构造阶段下发的上下文，**原样回传**（TON 的 cell 树需要）。
+    context: Option<Value>,
+    /// 签名列表（BTC 多输入场景），顺序须与构造阶段下发的待签对象一致。
+    signatures: Option<Vec<String>>,
+}
+
 /// 启动 HTTP 服务并**一直阻塞**直到进程被终止。
 ///
 /// 语法说明：参数写成 `host: String` / `port: u16` 而不是引用，
@@ -121,7 +156,11 @@ pub async fn serve(host: String, port: u16) -> anyhow::Result<()> {
         .route("/v1/tx", get(tx_handler))
         .route("/v1/address-from-pubkey", get(address_from_pubkey_handler))
         // 写操作只挂在 POST 上。
-        .route("/v1/transfer", post(transfer_handler));
+        .route("/v1/transfer", post(transfer_handler))
+        // 两段式的两个端点。构造走 GET：它只读取链上状态并在本地组装，
+        // 既不广播也不接触私钥，没有副作用；广播走 POST。
+        .route("/v1/build-transfer", get(build_transfer_handler))
+        .route("/v1/submit-tx", post(submit_tx_handler));
 
     // `format!("{host}:{port}")` 是内联格式化捕获：大括号里写变量名即可，
     // 等价于 `format!("{}:{}", host, port)`。
@@ -139,6 +178,8 @@ pub async fn serve(host: String, port: u16) -> anyhow::Result<()> {
     eprintln!(
         "  POST /v1/transfer   body: {{chain,to,amount,private_key?,dry_run?,from?,network?,rpc_url?}}"
     );
+    eprintln!("  GET /v1/build-transfer?chain=eth&from=0x..&to=0x..&amount=0.01[&public_key=..]");
+    eprintln!("  POST /v1/submit-tx   body: {{chain,signed_tx_hex,encoding?,context?,signatures?}}");
 
     // 先 `bind` 再 `serve`：分开写的好处是绑定失败（端口被占用）会以 `Err` 提前返回，
     // 由 main 里的 `?` 转给 anyhow 打印，而不是在 axum 内部 panic。
@@ -239,6 +280,42 @@ async fn transfer_handler(JsonExtractor(body): JsonExtractor<TransferBody>) -> R
             private_key: body.private_key,
             dry_run: body.dry_run,
             from: body.from,
+        },
+    )
+    .await
+}
+
+/// `GET /v1/build-transfer`：无私钥构造转账（两段式第一阶段）。
+///
+/// 返回 `unsigned_tx_hex` + `signing_payload_hex` + 签名算法标识，
+/// 以及需要原样回传的 `extra.submit_context`。全程不接触私钥。
+async fn build_transfer_handler(Query(params): Query<BuildTransferParams>) -> Response {
+    run(
+        params.base,
+        Action::BuildTransfer {
+            from: params.from,
+            to: params.to,
+            amount: params.amount,
+            public_key: params.public_key,
+        },
+    )
+    .await
+}
+
+/// `POST /v1/submit-tx`：广播已签名交易（两段式第二阶段）。
+async fn submit_tx_handler(JsonExtractor(body): JsonExtractor<SubmitTxBody>) -> Response {
+    // 与 `transfer_handler` 同样的重组：body 是扁平的，手动拼出 `BaseParams`。
+    run(
+        BaseParams {
+            chain: body.chain,
+            network: body.network,
+            rpc_url: body.rpc_url,
+        },
+        Action::SubmitTx {
+            signed_tx_hex: body.signed_tx_hex,
+            encoding: body.encoding,
+            context: body.context,
+            signatures: body.signatures,
         },
     )
     .await

@@ -47,23 +47,24 @@ pub enum ChainKind {
     Ton,
 }
 
-/// 只读四件套。
+/// 全量能力（含本地签名转账）。
+///
+/// 后两项是「无私钥两段式」能力：`build_transfer` 由 SDK 构造未签名交易并返回待签对象，
+/// `submit` 广播调用方签完名的交易——两者合起来让私钥全程不必交给 SDK。
 ///
 /// 语法说明：`const` 定义常量，类型必须**显式写出**且编译期已知大小。
-/// `[&str; 4]` 读作「元素类型为 `&str`、长度为 4 的数组」；
-/// 长度写进类型里，所以 `[&str; 4]` 和 `[&str; 5]` 是两个不同的类型。
+/// `[&str; 8]` 读作「元素类型为 `&str`、长度为 8 的数组」；
+/// 长度写进类型里，所以 `[&str; 8]` 和 `[&str; 5]` 是两个不同的类型。
 /// `const`（编译期常量）与 `let`（运行期绑定）的区别：`const` 的值会被内联到每处使用点。
-/// 只读 + 公钥派生地址（纯本地计算）。
-const READ_AND_DERIVE_CAPABILITIES: [&str; 5] =
-    ["status", "balance", "block", "tx", "address_from_pubkey"];
-/// 全量能力（含本地签名转账）。
-const FULL_CAPABILITIES: [&str; 6] = [
+const FULL_CAPABILITIES: [&str; 8] = [
     "status",
     "balance",
     "block",
     "tx",
     "address_from_pubkey",
     "transfer",
+    "build_transfer",
+    "submit",
 ];
 
 // `impl ChainKind { ... }` 是**固有实现块**：给 `ChainKind` 这个类型挂上一组方法。
@@ -200,9 +201,9 @@ impl ChainKind {
 
     /// 该链在统一接口下真实可用的能力清单。
     ///
-    /// 除 SUI 外九链（ETH / BTC / SOL / NEAR / APT / AR / CKB / FIL / TON）均具备全量能力
-    /// （含本地签名转账）；SUI 的本地签名转账依赖 `sui-graphql-client` / `sui-sdk-types`，
-    /// 版本同步存在风险，暂不实现，仅声明只读 + 公钥派生地址能力。
+    /// 十链（ETH / BTC / SOL / NEAR / APT / AR / CKB / FIL / SUI / TON）均具备全量能力。
+    /// SUI 此前因 `sui-graphql-client` / `sui-sdk-types` 版本同步风险而暂缓写操作，
+    /// 现 `transfer` 已实现，故与其他链一致返回全量。
     ///
     /// 语法说明：返回值 `&'static [&'static str]` 是「对静态字符串切片数组的引用」，
     /// 拆开读作 `&'static ( [ &'static str ] )`。返回引用而非 `Vec` 是为了零分配：
@@ -210,14 +211,11 @@ impl ChainKind {
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
             // 一个分支里匹配多个变体，用 `|` 分隔。
-            // `&FULL_CAPABILITIES`：`&` 取引用，把 `[&str; 6]` 借成 `&[&str]`（切片），
+            // `&FULL_CAPABILITIES`：`&` 取引用，把 `[&str; 8]` 借成 `&[&str]`（切片），
             // 长度信息从类型里「擦除」掉了，这正是返回类型只写 `[..]` 而不写长度的原因。
             ChainKind::Eth | ChainKind::Btc | ChainKind::Sol | ChainKind::Near | ChainKind::Apt
-            | ChainKind::Ar | ChainKind::Ckb | ChainKind::Fil | ChainKind::Ton => {
-                &FULL_CAPABILITIES
-            }
-            // SUI 暂缓 transfer（见上方说明）。
-            ChainKind::Sui => &READ_AND_DERIVE_CAPABILITIES,
+            | ChainKind::Ar | ChainKind::Ckb | ChainKind::Fil | ChainKind::Sui
+            | ChainKind::Ton => &FULL_CAPABILITIES,
         }
     }
 
@@ -226,8 +224,8 @@ impl ChainKind {
     /// 语法说明：`matches!(值, 模式)` 是标准库宏，等价于
     /// `match 值 { 模式 => true, _ => false }`，只是更短。末尾的 `!` 表示这是宏而非函数。
     pub fn supports_transfer(self) -> bool {
-        // 除 SUI（转账依赖版本同步不稳定的 sui-graphql-client）外，九链均支持。
-        // 显式列出支持项而非 `!matches!(Sui)`，避免新增链被默认「偷偷」开放转账。
+        // 十链全部实现了 `transfer`（SUI 此前因 graphql 依赖版本风险暂缓，现已补齐）。
+        // 显式列出支持项而非 `!matches!(..)`，避免新增链被默认「偷偷」开放转账。
         matches!(
             self,
             ChainKind::Eth
@@ -238,6 +236,50 @@ impl ChainKind {
                 | ChainKind::Ar
                 | ChainKind::Ckb
                 | ChainKind::Fil
+                | ChainKind::Sui
+                | ChainKind::Ton
+        )
+    }
+
+    /// 是否支持「无私钥构造转账」：仅凭 `from` / `to` / `amount` 组装未签名交易，
+    /// 并返回待签对象，私钥无需交给 SDK。
+    ///
+    /// 语法说明：与 `supports_transfer` 同样用 `matches!` 白名单。
+    /// **AR 被刻意排除**：Arweave 交易必须携带 `owner` 字段（RSA 公钥模数），
+    /// 而 AR 地址是模数的 SHA-256 摘要——由摘要无法反推模数，
+    /// 因此仅凭地址在数学上不可能构造出合法 AR 交易。
+    pub fn supports_build_transfer(self) -> bool {
+        matches!(
+            self,
+            ChainKind::Eth
+                | ChainKind::Btc
+                | ChainKind::Sol
+                | ChainKind::Near
+                | ChainKind::Apt
+                | ChainKind::Ckb
+                | ChainKind::Fil
+                | ChainKind::Sui
+                | ChainKind::Ton
+        )
+    }
+
+    /// 是否支持广播「调用方已签名」的交易（与 `build_transfer` 配对的第二阶段）。
+    ///
+    /// 覆盖了 `supports_transfer` 的全部十链：AR 虽然无法**无私钥构造**，
+    /// 但如果调用方用别的方式（如自有 RSA 私钥离线）签出了交易，
+    /// 广播本身不需要任何私密材料，故 AR 同样支持 `submit`。
+    pub fn supports_submit(self) -> bool {
+        matches!(
+            self,
+            ChainKind::Eth
+                | ChainKind::Btc
+                | ChainKind::Sol
+                | ChainKind::Near
+                | ChainKind::Apt
+                | ChainKind::Ar
+                | ChainKind::Ckb
+                | ChainKind::Fil
+                | ChainKind::Sui
                 | ChainKind::Ton
         )
     }

@@ -246,6 +246,37 @@ async fn execute(name: &str, arguments: &Value) -> Result<allchain_core::Envelop
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         },
+        // 两段式第一阶段：没有任何私钥参数，字段与 chain_transfer 有意区分开。
+        "chain_build_transfer" => Action::BuildTransfer {
+            from: require_str(arguments, "from")?.to_string(),
+            to: require_str(arguments, "to")?.to_string(),
+            amount: require_str(arguments, "amount")?.to_string(),
+            public_key: arguments
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+        // 两段式第二阶段。
+        "chain_submit_tx" => Action::SubmitTx {
+            signed_tx_hex: require_str(arguments, "signed_tx_hex")?.to_string(),
+            encoding: arguments
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            // `context` 是**不透明的 JSON**：整个 `Value` 克隆回传，不解析、不校验。
+            // SDK 明确要求「复制回来即可」——这里多做任何一层解释，
+            // 都可能与某条链的实现跑偏（TON 的 cell 树尤其敏感）。
+            context: arguments.get("context").cloned(),
+            // 语法说明：`and_then(Value::as_array)` 拿到 `Option<&Vec<Value>>`，
+            // 再用 `filter_map` 把每个元素转成 `&str`、跳过非字符串元素，最后 `collect()` 成 `Vec<String>`。
+            // 用 `filter_map` 而不是 `map` 是为了顺手丢掉类型不对的元素，
+            // 让「数组里混了非字符串」退化成「少一个签名」（会被下游的长度校验拦下），
+            // 而不是变成一次 panic。
+            signatures: arguments
+                .get("signatures")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
+        },
         // 兜底分支：未知工具名。注意这里是 `return Err(..)` 直接退出函数，
         // 因为已经没有 `Action` 可构造了；`{other}` 会把工具名内联进提示里。
         other => return Err(format!("未知工具: {other}")),
@@ -433,12 +464,13 @@ fn tools() -> Vec<Value> {
         json!({
             "name": "chain_transfer",
             // 这是唯一会动用私钥、可能造成真实资产损失的工具，描述里刻意写足了安全提示：
-            // 能力边界（只有四链）、私钥来源优先级、format 说明，
+            // 能力边界（只有三链，BTC 已改为两段式）、私钥来源优先级、format 说明，
             // 以及最后一句「陌生环境先 dry_run」——这是给 agent 的操作规程，不是给用户看的文案。
-            "description": "转账原生资产：仅 eth / btc / sol / near 四链支持本地构造、签名并广播；其余六链返回 UNSUPPORTED。\
-                            私钥优先用 private_key 参数；缺省时读环境变量 ETH_SECRET_KEY / BTC_WIF / SOL_KEYPAIR / NEAR_SECRET_KEY。\
+            "description": "转账原生资产：仅 eth / sol / near 三链支持本地构造、签名并广播；其余七链返回 UNSUPPORTED。\
+                            ⚠️ BTC 不在此列：BTC 侧已移除本地签名，请改用 chain_build_transfer + chain_submit_tx 两段式。\
+                            私钥优先用 private_key 参数；缺省时读环境变量 ETH_SECRET_KEY / SOL_KEYPAIR / NEAR_SECRET_KEY。\
                             dry_run=true 时只本地构造并签名（返回预期 tx_hash 与签名详情），绝不广播，可用于审计。\
-                            private_key 格式：ETH 32 字节十六进制；BTC WIF；SOL JSON 数组或 base58 的 64 字节；NEAR ed25519:...。\
+                            private_key 格式：ETH 32 字节十六进制；SOL JSON 数组或 base58 的 64 字节；NEAR ed25519:...。\
                             NEAR 的 from 传命名账户；省略时按私钥派生隐式账户。\
                             先对陌生环境用 dry_run 验证，再正式 broadcast，防止误转。",
             "inputSchema": {
@@ -456,6 +488,57 @@ fn tools() -> Vec<Value> {
                 // `required` 里**没有** `private_key`：它通常由环境变量提供
                 // （见 dispatch::resolve_private_key），写进必填会逼 agent 每次都索要私钥。
                 "required": ["chain", "to", "amount"]
+            }
+        }),
+        json!({
+            "name": "chain_build_transfer",
+            // 两段式的第一阶段。描述里反复强调「不接收私钥」——这是它与 chain_transfer
+            // 的根本差别，也正是 agent 判断该用哪个工具的依据：
+            // 私钥不能交给 SDK 的场景，就必须走这两个工具而不是 chain_transfer。
+            "description": "无私钥构造转账（两段式第一阶段）：只凭 from / to / amount 组装未签名交易，\
+                            返回 unsigned_tx_hex、真正要签的 signing_payload_hex、签名算法标识，\
+                            以及下一步需要原样回传的 extra.submit_context。\
+                            本工具不接收也不接触私钥，私钥始终留在调用方。\
+                            注意 signing_payload_hex 与 unsigned_tx_hex 是两份不同的数据——\
+                            多数链里「最终交易字节」并不等于「待签字节」，务必签前者。\
+                            支持 eth / btc / sol / near / apt / ckb / fil / sui / ton；\
+                            ar 不支持（AR 地址是 RSA 模数的摘要，无法反推模数）。\
+                            public_key：NEAR / APT 等「账户与密钥解耦」的链需要。\
+                            下一步：对 signing_payload_hex 签名，再调 chain_submit_tx。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chain": chain_prop(),
+                    "from": { "type": "string", "description": "付款地址/账户；必填，因为没有私钥可供推导" },
+                    "to": { "type": "string", "description": "收款地址；NEAR 传账户名" },
+                    "amount": { "type": "string", "description": "金额，原生单位（如 0.01）" },
+                    "public_key": { "type": "string", "description": "签名公钥；NEAR / APT 等多密钥账户需要" },
+                    "network": network_prop(),
+                    "rpc_url": rpc_prop()
+                },
+                "required": ["chain", "from", "to", "amount"]
+            }
+        }),
+        json!({
+            "name": "chain_submit_tx",
+            "description": "广播已签名交易（两段式第二阶段）：只接收签完名的交易字节，全程不接触私钥。\
+                            与 chain_build_transfer 配对，构成「SDK 构造 → agent 签名 → SDK 广播」闭环。\
+                            signed_tx_hex 为已签名交易的十六进制；encoding=base64 时该字段填 base64 串（SOL / SUI 等）。\
+                            context：把构造阶段返回的 extra.submit_context **原样回填**，不必理解其内容（TON 的 cell 树需要）。\
+                            signatures：签名数组，仅 BTC 这类多待签对象的链需要，顺序须与构造阶段下发的待签对象一致。\
+                            支持全部十链（含 ar——ar 无法无私钥构造，但广播不需要私密材料）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chain": chain_prop(),
+                    "signed_tx_hex": { "type": "string", "description": "已签名交易的十六进制（encoding=base64 时为 base64 串）" },
+                    "encoding": { "type": "string", "description": "编码：hex（默认）或 base64" },
+                    "context": { "type": "object", "description": "构造阶段下发的 submit_context，原样回传" },
+                    "signatures": { "type": "array", "items": { "type": "string" }, "description": "签名列表；顺序须与构造阶段下发的待签对象一致（BTC 多输入场景）" },
+                    "network": network_prop(),
+                    "rpc_url": rpc_prop()
+                },
+                "required": ["chain", "signed_tx_hex"]
             }
         }),
     ]

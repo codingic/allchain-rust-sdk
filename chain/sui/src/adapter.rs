@@ -25,19 +25,19 @@ use blake2::digest::{Update, VariableOutput};
 use serde_json::{Value, json};
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, ErrorCode, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, ErrorCode, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest,
+    TransferView, TxStatus, TxView, hexutil,
 };
 // 共用工具层：HTTP 客户端 + 宽松数值解析 + RFC3339 时间解析。
 use chain_rpcutil::{Http, loose_u64, loose_u128, rfc3339_to_unix};
 
 // 本地构造并签名 SUI 交易（Programmable Transaction Block）所需。
-use sui_sdk_types::{
-    Address, Argument, Command, Digest, GasPayment, Input, Intent, IntentAppId, IntentScope,
-    IntentVersion, ObjectReference, ProgrammableTransaction, SignatureScheme, SignedTransaction,
-    SplitCoins, Transaction, TransactionExpiration, TransactionKind, TransferObjects,
-    UserSignature,
-};
+//
+// 交易体（PTB）的构造与签名摘要的计算都下沉到了 `crate::tx`，
+// 这里只保留适配器自身要用的类型：地址、对象引用、digest、签名封装。
+// 少一个导入就少一处「两条路径写法漂移」的隐患。
+use sui_sdk_types::{Address, Digest, ObjectReference, SignatureScheme, UserSignature};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use base64::Engine;
 use bcs;
@@ -52,9 +52,21 @@ use crate::network;
 /// （甚至可能是空结果，而不是报错——这是 Sui GraphQL 的一个易踩的坑）。
 const SUI_COIN_TYPE: &str = "0x2::sui::SUI";
 
+/// SUI coin **对象**的 Move 类型，用于 `objects(filter: { type: … })` 过滤。
+///
+/// 注意它与 [`SUI_COIN_TYPE`] 是两个不同的东西：
+/// - `0x2::sui::SUI` 是「币种类别」，用于 `balance(coinType: …)`；
+/// - `0x2::coin::Coin<0x2::sui::SUI>` 是「装这种币的对象类型」，用于按类型筛对象。
+///
+/// 混用不会报错，只会查不到对象（filter 按字符串精确匹配），
+/// 表现为「地址明明有钱却说没有 coin」。
+const SUI_COIN_OBJECT_TYPE: &str = "0x2::coin::Coin<0x2::sui::SUI>";
+
 /// SUI 转账的 gas budget（MIST，精度 9）。0.05 SUI 对单条 PTB 足够宽裕；
 /// 选币时要求 coin 余额 ≥ 转账额 + 该预算，确保同币既作转账源又作 gas 付款。
-const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
+/// `pub(crate)` 而非私有：`tx` 模块的无私钥构造流程也要用它，
+/// 两条路径共用同一个常量才不会「一体式用 0.05 SUI、两段式用另一个值」。
+pub(crate) const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
 
 /// checkpoint 查询里要取的字段清单，直接插进 GraphQL 选择集。
 ///
@@ -79,13 +91,67 @@ pub struct SuiClient {
 
 /// 构造查询某地址 SUI 主币 coin 对象的 GraphQL 查询。
 ///
-/// 字段名严格对齐 `sui-graphql-client 0.0.7` 的 `schema.graphql`（`Coin` 的 object id
-/// 字段是 `address` 而非 `coinObjectId`；`balance` 是返回 `Balance` 的方法，须读
-/// `balance { totalBalance }`；`Coin` 无 `type { repr }` 字段，改为用 `coins(type:)` 过滤）。
+/// # 现行 schema（2026-09 对 `graphql.mainnet.sui.io` 实测）
+///
+/// `Address` 上已经**没有** `coins` 字段了。旧写法（对齐 `sui-graphql-client 0.0.7`）
+/// `address { coins(first: 50, type: "0x2::sui::SUI") }` 现在会被
+/// `GRAPHQL_VALIDATION_FAILED` 整条拒掉，SUI 的构造流程因此完全不可用。
+/// 现行写法走 `objects(... filter: { type: … })`。
+///
+/// # 为什么余额读 `contents { json }` 而不是 `balance { totalBalance }`
+///
+/// 这是本函数最容易踩的坑，且踩了**不报错**：
+/// `MoveObject` 上确实也有 `balance(coinType:)` 字段，但对 coin 对象它恒返回 0。
+/// 实测证据——某地址 `0x0feb54a7…` 总余额 58,569,188,076,346 MIST，
+/// 其 10 个 coin 对象逐个查 `balance { totalBalance }` **全部是 "0"**；
+/// 真正的面值在 Move 结构内部，`contents { json }` 给出 `{"id":…, "balance": "57853702401719"}`。
+///
+/// 若误用前者，得到的是「所有 coin 余额为 0」，选币逻辑于是判定余额不足——
+/// 典型的**不报错、只给错答案**。
 fn coins_query(owner: &str) -> String {
     format!(
-        r#"{{ address(address: "{owner}") {{ coins(first: 50, type: "0x2::sui::SUI") {{ nodes {{ address balance {{ totalBalance }} digest version }} }} }} }}"#
+        r#"{{ address(address: "{owner}") {{ objects(first: 50, filter: {{ type: "{SUI_COIN_OBJECT_TYPE}" }}) {{ nodes {{ address version digest contents {{ json }} }} }} }} }}"#
     )
+}
+
+/// 把 GraphQL 返回的 `objects.nodes` 数组解析成 [`SuiCoin`] 列表。
+///
+/// # 为什么抽成纯函数
+///
+/// 面值该从哪个字段读，是本模块**最容易错且错了不报错**的地方
+/// （`balance.totalBalance` 对 coin 对象恒为 0，只有 `contents.json.balance` 才是真面值）。
+/// 把解析从 `fetch_sui_coins` 里抽出来，就能用**线上抓回的真实响应**当夹具做离线测试，
+/// 不必依赖网络，也不必有一个有币的密钥对。
+fn parse_sui_coins(nodes: &[Value]) -> Result<Vec<SuiCoin>, SdkError> {
+    let mut out = Vec::new();
+    for n in nodes {
+        let object_id = n
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 address (object id)"))?
+            .to_string();
+        // 面值在 Move 结构里（`contents.json.balance`，字符串形式的大整数），
+        // **不是** `balance.totalBalance`——后者对 coin 对象恒为 0。
+        let balance = n
+            .pointer("/contents/json/balance")
+            .and_then(loose_str_u128)
+            .ok_or_else(|| {
+                SdkError::new(ErrorCode::ParseError, "coin 缺 contents.json.balance")
+            })?;
+        let digest = n
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 digest"))?
+            .to_string();
+        // `version` 在现行 schema 里是 JSON 数字（UInt53），不是字符串，
+        // 故用 `loose_u64` 而不是 `loose_str_u128`。
+        let version = n
+            .get("version")
+            .and_then(|v| loose_u64(v).ok())
+            .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 version"))?;
+        out.push(SuiCoin { object_id, balance, digest, version });
+    }
+    Ok(out)
 }
 
 /// 构造广播已签名交易的 GraphQL mutation。
@@ -93,9 +159,18 @@ fn coins_query(owner: &str) -> String {
 /// 对齐 `sui-graphql-client 0.0.7` 的 `schema.graphql`：`executeTransactionBlock` 只接受
 /// `(txBytes, signatures)` 两个参数（**无** `requestType`）；返回 `ExecutionResult`
 /// 只有 `effects`，digest 在 `effects.transactionBlock.digest`，执行状态是枚举 `status`。
-fn broadcast_query(tx_base64: &str, sig_base64: &str) -> String {
+///
+/// 语法说明：`signatures` 是切片 `&[String]`，用 `join` 拼成
+/// `"a","b"` 这种 GraphQL 列表字面量。写成切片而非固定一个字符串，
+/// 是因为 Sui 允许多签（multisig / 赞助交易）携带多个签名。
+fn broadcast_query(tx_base64: &str, signatures: &[String]) -> String {
+    let list = signatures
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        r#"mutation {{ executeTransactionBlock(txBytes: "{tx_base64}", signatures: ["{sig_base64}"]) {{ effects {{ transactionBlock {{ digest }} status }} }} }}"#
+        r#"mutation {{ executeTransactionBlock(txBytes: "{tx_base64}", signatures: [{list}]) {{ effects {{ transactionBlock {{ digest }} status }} }} }}"#
     )
 }
 
@@ -154,46 +229,26 @@ impl SuiClient {
             .ok_or_else(|| SdkError::not_found("checkpoint 不存在"))
     }
 
-    /// 取出发件人的 `0x2::sui::SUI` coin 列表（GraphQL `address.coins`）。
+    /// 取出发件人的 `0x2::sui::SUI` coin 列表（GraphQL `address.objects`）。
     ///
-    /// 只保留原生 SUI coin；其余 coin type 直接跳过（SUI GraphQL 对缺省 `coins`
-    /// 不报错，只是返回所有类型，故在此按 `coinType` 过滤）。
-    async fn fetch_sui_coins(&self, owner: &str) -> Result<Vec<SuiCoin>, SdkError> {
+    /// 按 coin 对象类型过滤，只保留原生 SUI coin；其余 coin type 直接跳过。
+    /// 面值读 `contents.json.balance` 而非 `balance.totalBalance`，
+    /// 原因见 [`coins_query`] 的文档——读错了不报错，只会得到全 0。
+    pub(crate) async fn fetch_sui_coins(&self, owner: &str) -> Result<Vec<SuiCoin>, SdkError> {
         let query = coins_query(owner);
         let data = self.http.graphql(&query).await?;
         let nodes = data
-            .pointer("/address/coins/nodes")
+            .pointer("/address/objects/nodes")
             .and_then(|v| v.as_array())
             .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "SUI coins 查询无 nodes"))?;
-        let mut out = Vec::new();
-        for n in nodes {
-            let object_id = n
-                .get("address")
-                .and_then(Value::as_str)
-                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 address (object id)"))?
-                .to_string();
-            let balance = n
-                .pointer("/balance/totalBalance")
-                .and_then(loose_str_u128)
-                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 balance.totalBalance"))?;
-            let digest = n
-                .get("digest")
-                .and_then(Value::as_str)
-                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 digest"))?
-                .to_string();
-            let version = n
-                .get("version")
-                .and_then(|v| loose_u64(v).ok())
-                .ok_or_else(|| SdkError::new(ErrorCode::ParseError, "coin 缺 version"))?;
-            out.push(SuiCoin { object_id, balance, digest, version });
-        }
-        Ok(out)
+        parse_sui_coins(nodes)
     }
 
     /// 取参考 gas 价（GraphQL `epoch.referenceGasPrice`，字符串或数字大整数）。
-    async fn fetch_reference_gas_price(&self) -> Result<u64, SdkError> {
+    pub(crate) async fn fetch_reference_gas_price(&self) -> Result<u64, SdkError> {
         let query = "{ epoch { referenceGasPrice } }";
-        let data = self.http.graphql(&query).await?;
+        // 参数类型是泛型 `impl Serialize`，`String` 与 `&String` 都满足，直接按值传。
+        let data = self.http.graphql(query).await?;
         let v = data
             .pointer("/epoch/referenceGasPrice")
             .and_then(loose_str_u128)
@@ -206,9 +261,22 @@ impl SuiClient {
 
     /// 广播已签名的交易（GraphQL `executeTransactionBlock` mutation）。
     ///
-    /// 返回交易 digest；若执行状态非 `SUCCESS` 则报错。txBytes / signatures 均为 base64。
-    async fn broadcast_tx(&self, tx_base64: &str, sig_base64: &str) -> Result<String, SdkError> {
-        let query = broadcast_query(tx_base64, sig_base64);
+    /// 领域说明——两个参数的分工是 Sui 特有的：
+    /// - `tx_base64` 必须是 **`bcs(TransactionData)` 的 base64**，
+    ///   **不含** 3 字节 intent 前缀（前缀只在**签名时**拼接），也**不含**签名；
+    /// - `signatures` 是各自 base64 编码的 `flag || sig || pubkey`（ed25519 下 97 字节）。
+    ///
+    /// 早期实现误把 `bcs(SignedTransaction)`（交易体 + 签名打包后的整体）当作
+    /// `txBytes` 传进去，节点侧会反序列化失败。正确拆分见 `tx::split_signed`——
+    /// 那个函数是这条约束的唯一防线。
+    ///
+    /// 返回交易 digest；若执行状态非 `SUCCESS` 则报错。
+    pub(crate) async fn broadcast_tx(
+        &self,
+        tx_base64: &str,
+        signatures: &[String],
+    ) -> Result<String, SdkError> {
+        let query = broadcast_query(tx_base64, signatures);
         let data = self.http.graphql(&query).await?;
         let digest = data
             .pointer("/executeTransactionBlock/effects/transactionBlock/digest")
@@ -478,6 +546,10 @@ impl ChainClient for SuiClient {
             .map_err(|e| SdkError::new(ErrorCode::Internal, format!("发件地址构造失败: {e}")))?;
 
         // 4) 取出发件人可用 SUI coin + 参考 gas 价。
+        //
+        // 这两步与「无私钥」的 `build_transfer` 完全共用：
+        // 只有**签名**那一步涉及私钥，构造过程两侧必须逐字节一致，
+        // 否则会出现「dry-run 能过、真发失败」这类只在一条路径上复现的缺陷。
         let coins = self.fetch_sui_coins(&from_hex).await?;
         let coin = coins
             .into_iter()
@@ -501,59 +573,54 @@ impl ChainClient for SuiClient {
         );
 
         // 6) 构造 PTB：SplitCoins(coin, [amount]) → TransferObjects([split], to)。
-        let inputs = vec![
-            Input::ImmutableOrOwned(coin_ref.clone()),
-            Input::Pure { value: to_bytes.clone() },
-            Input::Pure {
-                value: amount.to_le_bytes().to_vec(),
-            },
-        ];
-        let commands = vec![
-            Command::SplitCoins(SplitCoins {
-                coin: Argument::Input(0),
-                amounts: vec![Argument::Input(2)],
-            }),
-            Command::TransferObjects(TransferObjects {
-                objects: vec![Argument::Result(0)],
-                address: Argument::Input(1),
-            }),
-        ];
-        let tx = Transaction {
-            kind: TransactionKind::ProgrammableTransaction(ProgrammableTransaction { inputs, commands }),
+        //
+        // 走 `tx::build_transaction` 而不是在这里内联，理由同上：
+        // 交易体的构造逻辑只有一份，两条签名路径不可能漂移。
+        let tx = crate::tx::build_transaction(&crate::tx::TransferParams {
             sender,
-            gas_payment: GasPayment {
-                objects: vec![coin_ref],
-                owner: sender,
-                price,
-                budget: DEFAULT_GAS_BUDGET,
-            },
-            expiration: TransactionExpiration::None,
-        };
+            public_key: vk.to_bytes(),
+            receiver: Address::new(
+                to_bytes
+                    .clone()
+                    .try_into()
+                    .map_err(|_| SdkError::invalid_argument("收款地址不是 32 字节"))?,
+            ),
+            amount,
+            coin: coin_ref,
+            gas_price: price,
+            gas_budget: DEFAULT_GAS_BUDGET,
+        })?;
 
-        // 7) 本地签名：Intent(TransactionData) ‖ BCS(Transaction) → ed25519 → UserSignature。
-        let intent = Intent::new(IntentScope::TransactionData, IntentVersion::V0, IntentAppId::Sui)
-            .to_bytes();
-        let mut msg = intent.to_vec();
-        msg.extend_from_slice(
-            &bcs::to_bytes(&tx)
-                .map_err(|e| SdkError::new(ErrorCode::Internal, format!("交易序列化失败: {e}")))?,
-        );
-        let sig = sk.sign(&msg);
+        // 7) 本地签名。
+        //
+        // **关键修正**：签的是 `blake2b256([0,0,0] || bcs(TransactionData))` 这个
+        // **32 字节摘要**，不是 intent 消息原文。官方规范见
+        // `docs.sui.io/learn/cryptography/sui-offline-signing`。
+        // 漏掉哈希时本地验签照样通过，只有节点会以 `InvalidSignature` 拒绝——
+        // 这类缺陷必须靠外部真值测试才能发现，见
+        // `tx::tests::signing_digest_is_the_blake2b_of_the_intent_message`。
+        //
+        // 摘要计算复用 `crate::tx::signing_digest`，与无私钥路径是同一个实现。
+        let digest = crate::tx::signing_digest(&tx)?;
+        let sig = sk.sign(&digest);
         let mut full = vec![SignatureScheme::Ed25519 as u8];
         full.extend_from_slice(&sig.to_bytes());
         full.extend_from_slice(&vk.to_bytes());
+        // 封装成 `UserSignature`：这一步顺带校验「flag ‖ sig ‖ pubkey」的
+        // 长度与方案合法性，比自己拼字符串后再交给节点要早暴露问题。
         let user_sig = UserSignature::from_bytes(&full)
             .map_err(|e| SdkError::new(ErrorCode::Internal, format!("签名封装失败: {e}")))?;
-        let signed = SignedTransaction {
-            transaction: tx,
-            signatures: vec![user_sig],
-        };
-        let tx_bytes = bcs::to_bytes(&signed)
-            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("签名交易序列化失败: {e}")))?;
-        let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
-        let sig_base64 = base64::engine::general_purpose::STANDARD.encode(&full);
+        // 用官方的 `to_base64()` 而不是自己 base64 编码：编码方式只有一处定义。
+        let sig_base64 = user_sig.to_base64();
 
-        // 8) dry-run：仅返回本地签名，不广播。
+        // 8) 广播用的两个参数必须**分开**：
+        //    tx_bytes 是纯 `bcs(TransactionData)`，签名单独传。
+        //    早期版本把 `bcs(SignedTransaction)` 整体当 tx_bytes 传，节点会拒绝。
+        let tx_bytes = bcs::to_bytes(&tx)
+            .map_err(|e| SdkError::new(ErrorCode::Internal, format!("交易序列化失败: {e}")))?;
+        let tx_base64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+        // 9) dry-run：仅返回本地签名，不广播。
         if req.dry_run {
             return Ok(TransferView::new(
                 ChainKind::Sui,
@@ -567,18 +634,178 @@ impl ChainClient for SuiClient {
             .with_extra(json!({ "signed_tx_base64": tx_base64 })));
         }
 
-        // 9) 真发：GraphQL executeTransactionBlock 广播。
-        let digest = self.broadcast_tx(&tx_base64, &sig_base64).await?;
+        // 10) 真发：GraphQL executeTransactionBlock 广播。
+        let tx_digest = self.broadcast_tx(&tx_base64, &[sig_base64]).await?;
         Ok(TransferView::new(
             ChainKind::Sui,
             &self.network,
             Some(from_hex),
             req.to,
             amount as u128,
-            Some(digest),
+            Some(tx_digest),
             true,
         )
         .with_extra(json!({ "signed_tx_base64": tx_base64 })))
+    }
+
+    /// **无私钥**构造转账：选 coin、取 gas 价、组装 PTB，产出待签摘要。
+    ///
+    /// 与 [`ChainClient::transfer`] 的分工：`transfer` 是**一段式**（私钥进 SDK，
+    /// 构造 + 签名 + 广播全在 SDK 内）；本方法是**两段式**的第一段——只组装，
+    /// 签名交给调用方（agent）用自己的私钥做，私钥从不进入本进程。
+    ///
+    /// 调用方拿到结果后应：
+    ///   1. 对 `signing_payload_hex`（32 字节 blake2b-256 摘要）做 ed25519 签名；
+    ///   2. 把 64 字节签名写到 `unsigned_tx_hex` 的 `signature_offset` 处；
+    ///   3. 交给 [`Self::submit_tx`] 广播。
+    ///
+    /// 领域说明——为什么本链**必须**显式给 `public_key`：
+    /// Sui 的地址是 `blake2b256(flag || pubkey)`，**哈希不可逆**；
+    /// 而 `UserSignature` 里又必须带公钥（节点靠它定位签名密钥）。
+    /// 没有公钥就组不出可广播的字节，故没有回退路径。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        // 三个地址/金额的解析都是纯本地的，失败即为参数错误，
+        // 不必联网——让错误尽早、便宜地暴露。
+        let sender = Address::from_str(req.from.trim())
+            .map_err(|e| SdkError::invalid_argument(format!("非法 SUI 付款地址 {}: {e}", req.from)))?;
+        let receiver = Address::from_str(req.to.trim())
+            .map_err(|e| SdkError::invalid_argument(format!("非法 SUI 收款地址 {}: {e}", req.to)))?;
+        let amount = parse_sui_mist(&req.amount)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 SUI 金额: {e}")))?;
+
+        // 公钥必填，且必须是 ed25519。secp256k1 / secp256r1 的地址派生虽已支持，
+        // 但两段式流程里的占位签名写死了 ed25519 标志位，故此处明确拒绝而不是静默出错。
+        let public_key = self.resolve_signer_public_key(req.public_key.as_deref(), &sender)?;
+
+        let unsigned =
+            crate::tx::build_unsigned_transfer(self, sender, public_key, receiver, amount).await?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Sui,
+            &self.network,
+            req.from,
+            req.to,
+            amount as u128,
+            unsigned.unsigned_tx_hex,
+            unsigned.signing_payload_hex,
+            "ed25519",
+            // Sui 与其余 ed25519 链不同：待签对象是 **blake2b-256 摘要**（32 字节），
+            // 不是消息原文。这一步哈希是官方规范强制的，漏掉会导致节点拒签。
+            "blake2b-256",
+        )
+        .with_extra(json!({
+            "public_key": hexutil::encode_hex_prefixed(&public_key),
+            // 广播时单独提交的 bcs(TransactionData)，便于调用方核对「签的是什么」。
+            "tx_bytes_hex": unsigned.tx_bytes_hex,
+            "gas_coin_id": unsigned.gas_coin_id.to_string(),
+            "gas_price": unsigned.gas_price,
+            "gas_budget": unsigned.gas_budget,
+            // 与 NEAR / APT 的「覆盖最后 64 字节」不同：Sui 的 UserSignature 是
+            // flag || sig || pubkey，公钥在签名**之后**，故这里给的是显式偏移。
+            "splice": "replace_64_bytes_at_offset",
+            "signature_offset": unsigned.signature_offset,
+            "signature_length": 64,
+            "note": "对 signing_payload_hex（32 字节 blake2b-256 摘要）做 ed25519 签名；\
+                     把得到的 64 字节写到 unsigned_tx_hex 的 signature_offset 处后提交",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 广播已签名交易，返回交易 digest。
+    ///
+    /// 领域说明：Sui 的 `executeTransactionBlock` 是**同步等待执行结果**的
+    /// （返回里带 `effects.status`），故这里的 digest 意味着交易**已执行成功**，
+    /// 与 ETH / NEAR 那种「进 mempool 就返回、落块另说」的模型不同。
+    ///
+    /// 编码说明：`encoding` 支持 `hex`（默认）与 `base64`；
+    /// 两者都指向同一份 `bcs(SignedTransaction)` 字节。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+
+        let raw = match encoding {
+            "hex" => hexutil::decode_hex(&req.signed_tx_hex)?,
+            "base64" => base64::engine::general_purpose::STANDARD
+                .decode(req.signed_tx_hex.trim())
+                .map_err(|e| {
+                    SdkError::invalid_argument(format!("已签名交易不是合法 base64: {e}"))
+                })?,
+            other => {
+                return Err(SdkError::invalid_argument(format!(
+                    "SUI 已签名交易只接受 hex 或 base64 编码，收到 {other}"
+                )))
+            }
+        };
+        if raw.is_empty() {
+            return Err(SdkError::invalid_argument("已签名交易为空"));
+        }
+
+        let digest = crate::tx::broadcast_raw(self, &raw).await?;
+
+        Ok(SubmitView::new(ChainKind::Sui, &self.network, digest).with_extra(json!({
+            "broadcast": true,
+            "encoding": encoding,
+        })))
+    }
+}
+
+impl SuiClient {
+    /// 解析并校验「用哪把公钥签名」，同时确认它确实对应付款地址。
+    ///
+    /// 领域说明——为什么要做地址一致性校验：
+    /// 一个 Sui 账户名下可以挂多把密钥，用错一把仍能签出**结构合法**的交易，
+    /// 但节点会以含糊的 `InvalidSignature` / `SignerNotFound` 拒绝。
+    /// 在本地把这桩错误拦下，比让用户拿着一笔广播失败的交易去猜要省事得多。
+    ///
+    /// 语法说明：`explicit: Option<&str>` 用 `Option` 表达「调用方没给」，
+    /// 而不是用空串之类的哨兵值——后者属于「不适用场景」而非「错误」，
+    /// 这里按约定统一在**缺失**时才判定为错误。
+    fn resolve_signer_public_key(
+        &self,
+        explicit: Option<&str>,
+        sender: &Address,
+    ) -> Result<[u8; 32], SdkError> {
+        let raw = explicit
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                SdkError::invalid_argument(
+                    "SUI 构造交易必须显式提供 public_key：\
+                     地址是 blake2b256(flag || 公钥)，无法反推；\
+                     请传 32 字节 ed25519 公钥（0x + 64 位十六进制）",
+                )
+            })?;
+
+        // 只接受 ed25519：带其它方案前缀的直接拒绝，避免静默产出无效交易。
+        let hex_part = match raw.split_once(':') {
+            Some(("ed25519", rest)) => rest,
+            Some((other, _)) => {
+                return Err(SdkError::unsupported(format!(
+                    "SUI 两段式流程目前只支持 ed25519 公钥，收到方案 {other}"
+                )))
+            }
+            // 裸十六进制默认 ed25519，与 `derive_address` 的约定保持一致。
+            None => raw,
+        };
+        let bytes = hexutil::decode_hex(hex_part)
+            .map_err(|e| SdkError::invalid_argument(format!("非法 SUI 公钥: {e}")))?;
+        let public_key = crate::tx::validate_public_key(&bytes)?;
+
+        // 地址一致性：用同一套派生规则反算地址，逐字节比对。
+        let derived = address_from_pubkey_bytes(&public_key);
+        if derived != sender.to_string() {
+            return Err(SdkError::invalid_argument(format!(
+                "公钥与付款地址不匹配：公钥派生出 {derived}，而 from 是 {sender}"
+            )));
+        }
+        Ok(public_key)
     }
 }
 
@@ -724,11 +951,17 @@ fn parse_sui_mist(s: &str) -> Result<u64, String> {
 }
 
 /// 转账用：选出的一条 SUI coin（来自 GraphQL `address.coins`）。
-struct SuiCoin {
-    object_id: String,
-    balance: u128,
-    digest: String,
-    version: u64,
+///
+/// 字段设为 `pub(crate)`：`tx` 模块的无私钥流程也要读它们来拼对象引用。
+/// 类型本身也要 `pub(crate)`：Rust 要求**类型至少和用到它的函数一样可见**，
+/// 否则 `pub(crate) fn fetch_sui_coins() -> Vec<SuiCoin>` 会触发
+/// `private_interfaces` 告警（`tx` 模块也用得到它）。
+/// 不用 `pub`，是因为它属于内部数据形状，不该成为对外契约的一部分。
+pub(crate) struct SuiCoin {
+    pub(crate) object_id: String,
+    pub(crate) balance: u128,
+    pub(crate) digest: String,
+    pub(crate) version: u64,
 }
 
 /// 严格校验 Sui 地址：必须是 `0x` + **恰好 64 位**十六进制。
@@ -873,6 +1106,11 @@ mod tests {
 
     /// 离线验证：构造一笔 SUI 转账交易（PTB）、本地签名，签名能被派生公钥验过，
     /// 且 UserSignature 封装能原样解回 flag ‖ sig ‖ pubkey。无需任何 RPC。
+    ///
+    /// **本测试刻意复用 `crate::tx` 的构造与摘要函数**，而不是在这里重写一遍：
+    /// 早先版本在这里内联了「intent ‖ bcs(tx) → 直接签名」的写法，
+    /// 结果把「漏掉 blake2b-256」这个缺陷**固化成了断言**——
+    /// 实现错了，测试却是绿的。共用同一份实现才能杜绝这种情形。
     #[test]
     fn transfer_tx_signs_and_verifies_offline() {
         use ed25519_dalek::Verifier;
@@ -883,80 +1121,170 @@ mod tests {
         let from_hex = address_from_pubkey_bytes(&vk.to_bytes());
         let sender = Address::from_str(&from_hex).unwrap();
         // 收款地址（规范化 0x + 64hex）→ 32 字节 Pure 输入。
-        let to_bytes = hexutil::decode_hex(&format!("0x{}", "02".repeat(32))).unwrap();
+        let receiver = Address::from_str(&format!("0x{}", "02".repeat(32))).unwrap();
         let amount: u64 = 10_000_000;
 
         // 2) 用一个确定性 digest 造一个对象引用（仅用于离线构造，不接触链）。
-        let coin_ref = ObjectReference::new(sender, 0, Digest::from_bytes(&[0u8; 32]).unwrap());
-        // 3) 构造 PTB：SplitCoins(coin, [amount]) → TransferObjects([split], to)。
-        let tx = Transaction {
-            kind: TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
-                inputs: vec![
-                    Input::ImmutableOrOwned(coin_ref.clone()),
-                    Input::Pure { value: to_bytes.clone() },
-                    Input::Pure { value: amount.to_le_bytes().to_vec() },
-                ],
-                commands: vec![
-                    Command::SplitCoins(SplitCoins {
-                        coin: Argument::Input(0),
-                        amounts: vec![Argument::Input(2)],
-                    }),
-                    Command::TransferObjects(TransferObjects {
-                        objects: vec![Argument::Result(0)],
-                        address: Argument::Input(1),
-                    }),
-                ],
-            }),
+        let coin_ref = ObjectReference::new(sender, 0, Digest::from_bytes([0u8; 32]).unwrap());
+        // 3) 构造 PTB —— 走 tx 模块，与运行时和两段式流程共用同一份实现。
+        let tx = crate::tx::build_transaction(&crate::tx::TransferParams {
             sender,
-            gas_payment: GasPayment {
-                objects: vec![coin_ref],
-                owner: sender,
-                price: 1000,
-                budget: DEFAULT_GAS_BUDGET,
-            },
-            expiration: TransactionExpiration::None,
-        };
+            public_key: vk.to_bytes(),
+            receiver,
+            amount,
+            coin: coin_ref,
+            gas_price: 1000,
+            gas_budget: DEFAULT_GAS_BUDGET,
+        })
+        .unwrap();
 
-        // 4) 本地签名（与 transfer 运行时同一套 Intent + ed25519 + UserSignature）。
-        let intent = Intent::new(IntentScope::TransactionData, IntentVersion::V0, IntentAppId::Sui)
-            .to_bytes();
-        let mut msg = intent.to_vec();
-        msg.extend_from_slice(&bcs::to_bytes(&tx).unwrap());
-        let sig = sk.sign(&msg);
+        // 4) 本地签名：签的是 **blake2b-256 摘要**，不是 intent 消息原文。
+        let digest = crate::tx::signing_digest(&tx).unwrap();
+        assert_eq!(digest.len(), 32, "待签对象应是 32 字节摘要");
+        let sig = sk.sign(&digest);
         let mut full = vec![SignatureScheme::Ed25519 as u8];
         full.extend_from_slice(&sig.to_bytes());
         full.extend_from_slice(&vk.to_bytes());
 
-        // 5) 验签：派生公钥必须认可该签名。
-        assert!(vk.verify(&msg, &sig).is_ok(), "种子重建的密钥对签名验签失败");
+        // 5) 验签：派生公钥必须认可「对摘要的签名」。
+        assert!(
+            vk.verify(&digest, &sig).is_ok(),
+            "种子重建的密钥对签名验签失败"
+        );
         // 6) UserSignature 封装可原样解回。
         let user_sig = UserSignature::from_bytes(&full).unwrap();
         let back = user_sig.to_bytes();
         assert_eq!(back.as_slice(), full.as_slice(), "UserSignature 往返不一致");
     }
 
+    /// 查询文本必须匹配**现行** Sui GraphQL schema（2026-09 对 mainnet 端点实测）。
+    ///
+    /// 这条测试的存在理由：旧版 `address { coins(...) }` 会被线上端点整条拒掉
+    /// （`GRAPHQL_VALIDATION_FAILED`），而这类错误只有真发请求才会暴露——
+    /// 单元测试里没有网络，靠这条文本断言兜住。
     #[test]
-    fn coins_query_matches_sui_0_0_7_schema() {
+    fn coins_query_matches_the_current_sui_schema() {
         let q = coins_query("0xabc");
+
+        // 1) 走 objects + filter，而不是已下线的 coins 字段。
         assert!(
-            q.contains("coins(first: 50, type: \"0x2::sui::SUI\")"),
-            "coins 查询应带 type 过滤参数"
+            q.contains("objects(first: 50, filter: { type: \"0x2::coin::Coin<0x2::sui::SUI>\" })"),
+            "必须按 coin **对象**类型过滤；旧的 coins(type:) 已被 schema 移除。实际: {q}"
         );
         assert!(
-            q.contains("address balance { totalBalance }"),
-            "coin 的 object id 字段是 address、余额须读 balance.totalBalance"
+            !q.contains("coins("),
+            "Address 已无 coins 字段，留着会让整条查询被拒。实际: {q}"
+        );
+
+        // 2) 面值只能从 contents.json 取。
+        //
+        // 反向钉住旧写法：只断言「包含新写法」是不够的——若有人把
+        // `balance { totalBalance }` 一起加回来，新断言照样通过，
+        // 而解析路径可能又指回那个恒为 0 的字段。
+        assert!(
+            q.contains("contents { json }"),
+            "coin 面值在 Move 结构里，必须读 contents.json。实际: {q}"
         );
         assert!(
-            !q.contains("coinObjectId") && !q.contains("type { repr }"),
-            "0.0.7 schema 无 coinObjectId 字段、也无 type-repr 字段"
+            !q.contains("totalBalance"),
+            "MoveObject.balance 对 coin 对象恒为 0，读它会导致选币误判余额不足。实际: {q}"
+        );
+
+        // 3) 对象引用三元组缺一不可（Sui 对象模型要求 id + version + digest）。
+        for field in ["address", "version", "digest"] {
+            assert!(q.contains(field), "查询缺对象引用字段 {field}。实际: {q}");
+        }
+    }
+
+    /// 线上抓回的真实 `objects` 响应（2026-09-02，`graphql.mainnet.sui.io`）。
+    ///
+    /// 地址 `0x0feb54a7…`（总余额 58,569,188,076,346 MIST）的前 3 个 SUI coin。
+    /// 三个面值各不相同，所以「读错字段」不会恰好撞对——这是选它当夹具的原因。
+    const REAL_COINS_RESPONSE: &str = r#"{
+      "address": { "objects": { "nodes": [
+        { "address": "0x697a8e3343a521d1e0f5ea9b67360fcafc32504cb0813d27b41048f9f4e1bd92",
+          "version": 986735984,
+          "digest": "GQV5XZyUef1tRRnFSKZDhxvPEVV8zFY52a4bPdGThLGB",
+          "contents": { "json": {
+            "id": "0x697a8e3343a521d1e0f5ea9b67360fcafc32504cb0813d27b41048f9f4e1bd92",
+            "balance": "4049752227351" } } },
+        { "address": "0x62ac4e1870f2a08eb753922b13797a7004e1850405e15439f641fbaf5a21f6e1",
+          "version": 986736151,
+          "digest": "HZ77xm1PirJEsf4RMHgJWWtd6zW66R2wqRGFqZNfeRG6",
+          "contents": { "json": {
+            "id": "0x62ac4e1870f2a08eb753922b13797a7004e1850405e15439f641fbaf5a21f6e1",
+            "balance": "14633341382" } } },
+        { "address": "0x20fef4ce023beccec110991d0c0ee460fb82514d4afa68d804af17264f842533",
+          "version": 986736199,
+          "digest": "9eouAVVtz3L7RYhXQF13zvJwi5EPGG2ea4mz27Cp9Eeu",
+          "contents": { "json": {
+            "id": "0x20fef4ce023beccec110991d0c0ee460fb82514d4afa68d804af17264f842533",
+            "balance": "7985301260" } } }
+      ] } }
+    }"#;
+
+    /// 用真实响应验证解析：面值必须读到真数，而不是 0。
+    ///
+    /// # 为什么必须断言「非 0」
+    ///
+    /// 若把面值错读成 `balance.totalBalance`，解析**照样成功**、只是全为 0，
+    /// 所有「字段存在」类的断言都会通过。只有钉住真实数值才能挡住这个坑。
+    #[test]
+    fn parses_real_coin_balances_from_contents_json() {
+        let data: Value = serde_json::from_str(REAL_COINS_RESPONSE).expect("夹具应是合法 JSON");
+        let nodes = data
+            .pointer("/address/objects/nodes")
+            .and_then(|v| v.as_array())
+            .expect("夹具应含 objects.nodes");
+
+        let coins = parse_sui_coins(nodes).expect("真实响应应能解析");
+        assert_eq!(coins.len(), 3, "夹具里有 3 个 coin");
+
+        assert_eq!(coins[0].balance, 4_049_752_227_351, "第一个 coin 的面值");
+        assert_eq!(coins[1].balance, 14_633_341_382, "第二个 coin 的面值");
+        assert_eq!(coins[2].balance, 7_985_301_260, "第三个 coin 的面值");
+        assert!(
+            coins.iter().all(|c| c.balance > 0),
+            "真实 coin 面值都应大于 0；出现 0 说明读错了字段"
+        );
+
+        // 对象引用三元组：Sui 要求 id + version + digest 齐全且精确。
+        assert_eq!(
+            coins[0].object_id,
+            "0x697a8e3343a521d1e0f5ea9b67360fcafc32504cb0813d27b41048f9f4e1bd92"
+        );
+        assert_eq!(coins[0].version, 986_735_984, "version 是 JSON 数字，需按数字解析");
+        assert_eq!(coins[0].digest, "GQV5XZyUef1tRRnFSKZDhxvPEVV8zFY52a4bPdGThLGB");
+    }
+
+    /// 反向反证：只有 `balance.totalBalance` 而没有 `contents` 的节点必须**报错**。
+    ///
+    /// 没有这条，实现者可能「贴心地」加一条回落：读不到 contents 就退回
+    /// `balance.totalBalance`——那正是恒为 0 的字段，于是选币永远判余额不足。
+    /// 宁可报错，也不要悄悄给个错的。
+    #[test]
+    fn rejects_a_coin_node_without_contents_json() {
+        let data: Value = serde_json::from_str(
+            r#"{"address":{"objects":{"nodes":[{"address":"0xabc","version":7,
+                 "digest":"DIGEST","balance":{"totalBalance":"0"}}]}}}"#,
+        )
+        .expect("夹具应是合法 JSON");
+        let nodes = data
+            .pointer("/address/objects/nodes")
+            .and_then(|v| v.as_array())
+            .expect("夹具应含 nodes");
+
+        assert!(
+            parse_sui_coins(nodes).is_err(),
+            "缺 contents.json 的节点必须报错；静默回落到 totalBalance(=0) 会导致选币误判"
         );
     }
 
     #[test]
     fn broadcast_query_matches_sui_0_0_7_schema() {
-        let q = broadcast_query("TX", "SIG");
+        let q = broadcast_query("TX", &["SIG1".to_string(), "SIG2".to_string()]);
         assert!(
-            q.contains("executeTransactionBlock(txBytes: \"TX\", signatures: [\"SIG\"])"),
+            q.contains("executeTransactionBlock(txBytes: \"TX\", signatures: [\"SIG1\", \"SIG2\"])"),
             "executeTransactionBlock 仅接受 txBytes + signatures"
         );
         assert!(

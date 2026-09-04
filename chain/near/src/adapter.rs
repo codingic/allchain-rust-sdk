@@ -37,12 +37,16 @@ use near_primitives::views::{ActionView, FinalExecutionStatus, TxExecutionStatus
 use serde_json::json;
 
 use allchain_core::{
-    AddressView, BalanceView, BlockView, ChainClient, ChainKind, SdkError, StatusView,
-    TransferRequest, TransferView, TxStatus, TxView, hexutil,
+    AddressView, BalanceView, BlockView, BuildTransferRequest, BuildTransferView, ChainClient,
+    ChainKind, SdkError, StatusView, SubmitRequest, SubmitView, TransferRequest, TransferView,
+    TxStatus, TxView, hexutil,
 };
+// `AccessKeyPermissionView` 用于筛出「能转账」的 key：
+// 受限的 function-call key 只能调指定合约，签出的转账交易会被节点拒绝。
+use near_primitives::views::AccessKeyPermissionView;
 
 use crate::network::{self, NetworkArg};
-use crate::queries::{fetch_account, parse_block_reference};
+use crate::queries::{self, fetch_account, parse_block_reference};
 
 /// NEAR 客户端。
 ///
@@ -59,6 +63,31 @@ pub struct NearClient {
     rpc_url: String,
     /// 底层的 async JSON-RPC 客户端。
     client: JsonRpcClient,
+}
+
+/// 错误翻译的唯一入口：`上下文 + 底层错误` → `SdkError`。
+///
+/// 领域说明：`classify` 按关键词把错误归类（超时 → `NetworkError`、
+/// not found → `NotFound` 等），于是各链的错误码风格统一，
+/// 上层不必解析 NEAR 特有的错误文案。
+///
+/// ⚠️ 为什么参数要收敛成 `anyhow::Error` 而不是 `Display`：
+/// `anyhow::Error` 的 `Display` **只打印最外层上下文**，根因
+///（连接被拒 / 超时 / HTTP 状态码）藏在 `source()` 链里。
+/// 旧实现 `format!("{context}: {err}")` 恰好只触发 `Display`，
+/// 于是根因被静默丢弃——运维只看到「查询账户失败」，看不出是网络还是参数问题；
+/// `classify` 也因此失去关键词，把网络故障误判成兜底的 `RpcError`。
+///
+/// 语法说明：`{err:#}` 的 `#` 是**备用（alternate）格式化标志**。
+/// anyhow 给 `Display` 实现了两种形态：`{}` 只给最外层，
+/// `{:#}` 把整条链用 `": "` 串成**一行**——单行便于 `classify` 匹配，
+/// 含根因则保证了分类准确。
+fn fail(context: &str, err: impl Into<anyhow::Error>) -> SdkError {
+    // `.into()` 完成「具体错误类型 / anyhow::Error」→「anyhow::Error」的归一。
+    // 前者走 anyhow 的 `impl<E: Error + Send + Sync + 'static> From<E> for Error`，
+    // 后者走标准库的反射实现 `impl<T> From<T> for T`。
+    let err = err.into();
+    allchain_core::error::classify(&format!("{context}: {err:#}"))
 }
 
 // 固有实现块：构造器 + 私有辅助方法。
@@ -103,17 +132,101 @@ impl NearClient {
 
     /// 把底层错误统一归类成 `SdkError`。
     ///
-    /// 语法说明：`impl std::fmt::Display` 是**参数位置**的 `impl Trait`，
-    /// 等价于写成泛型 `fn fail<E: std::fmt::Display>(&self, context: &str, err: E)`
+    /// 语法说明：`impl Into<anyhow::Error>` 是**参数位置**的 `impl Trait`，
+    /// 等价于写成泛型 `fn fail<E: Into<anyhow::Error>>(&self, context: &str, err: E)`
     /// ——前者更短，代价是调用方无法用 turbofish 指定具体类型（这里也不需要）。
-    /// 用 `Display` 而不是具体的错误类型，是因为底层错误来自好几个不同 crate，
-    /// 它们唯一的共同点就是「能被打印出来」。
-    fn fail(&self, context: &str, err: impl std::fmt::Display) -> SdkError {
-        // `classify` 按关键词把错误归类（超时 → NetworkError、not found → NotFound 等），
-        // 于是各链的错误码风格统一，上层不必解析 NEAR 特有的错误文案。
-        // `{}` 走 `Display`（不是 `{:?}`）——这里要的是干净的单行信息给 classify 匹配。
-        allchain_core::error::classify(&format!("{context}: {err}"))
+    /// 用 `anyhow::Error` 而不是 `Display` 作为收敛点，是因为底层错误来自好几个
+    /// 不同 crate，而 **`anyhow::Error` 的 `Display` 只打印最外层上下文**：
+    /// 若在这里就用 `{}` 打印，根因（连接失败 / 超时 / HTTP 状态码）会从
+    /// `source()` 链里被永久丢掉，运维只能看到「查询账户失败」却不知为何失败。
+    ///
+    /// 真正的逻辑在同名的自由函数里；本方法只是转发，
+    /// 让调用点统一写成 `self.fail(..)`。约束必须与自由函数保持一致，
+    /// 否则在这一层就会退化成 `Display`、把链条截断。
+    fn fail(&self, context: &str, err: impl Into<anyhow::Error>) -> SdkError {
+        fail(context, err)
     }
+
+    /// 确定本次转账用哪把公钥签名（无私钥流程专用）。
+    ///
+    /// 三级回落，**顺序即正确性**：
+    /// 1. **调用方显式指定**——最可靠，优先采纳；
+    /// 2. **隐式账户反推**——账户名本身就是公钥的十六进制，纯本地即可还原；
+    /// 3. **查链上 access key 列表**——仅当名下恰好只有一把 full access key 时才敢代选。
+    ///
+    /// 为什么第 3 步要「唯一才敢选」：agent 手里握的是哪一把私钥，我们无从得知。
+    /// 多把 key 时随便挑一把，构造出的交易会绑定错误的公钥，
+    /// 节点返回的是含糊的 `InvalidAccessKey`，排查起来很痛苦——不如直接问调用方。
+    ///
+    /// 语法说明：`Option<&str>` 参数 + `.as_deref()` 是 Rust 里表示「可选字符串」的
+    /// 标准写法：调用方传 `req.public_key.as_deref()` 即可，无需克隆 `String`。
+    async fn resolve_signer_public_key(
+        &self,
+        account: &AccountId,
+        explicit: Option<&str>,
+    ) -> Result<PublicKey, SdkError> {
+        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return parse_public_key(raw);
+        }
+
+        if let Some(key) = derive_public_key_from_account(account) {
+            return Ok(key);
+        }
+
+        let list = queries::fetch_access_key_list(&self.client, account)
+            .await
+            .map_err(|e| self.fail("查询 access key 列表失败", e))?;
+
+        // `.filter_map(..)` 一次做完「筛 + 转换」：
+        // - 只保留 full access key（受限的 function-call key 签不出转账）；
+        // - `full_pubkey()` 对 ML-DSA-65 返回 `None`（链上只存摘要，无法还原完整公钥）。
+        let mut candidates: Vec<PublicKey> = list
+            .keys
+            .iter()
+            .filter(|k| matches!(k.access_key.permission, AccessKeyPermissionView::FullAccess))
+            .filter_map(|k| k.public_key.full_pubkey())
+            .collect();
+
+        match candidates.len() {
+            // `.remove(0)` 需要 `mut`（上面已声明）——这里 len 已知为 1，不会越界 panic。
+            1 => Ok(candidates.remove(0)),
+            0 => Err(SdkError::invalid_argument(format!(
+                "账户 {account} 名下没有可用的 full access key，无法构造转账"
+            ))),
+            // 把候选公钥全列出来：与其让用户自己去 RPC 上查，不如在报错里直接给他。
+            count => Err(SdkError::invalid_argument(format!(
+                "账户 {account} 名下有 {count} 把 full access key，\
+                 无法确定用哪把签名，请在请求里显式指定 public_key：{}",
+                candidates
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+}
+
+/// 从**隐式账户名**反推公钥；具名账户返回 `None`。
+///
+/// NEAR 的隐式账户规则：账户名 = 公钥原始字节的十六进制（小写、无 `0x` 前缀）。
+/// 因此 64 个十六进制字符 → ed25519（32 字节），128 个 → secp256k1（64 字节）。
+///
+/// 这是本文件里少有的「能本地反推」的情形——具名账户（`alice.near`）是注册出来的，
+/// 与密钥毫无关系，只能查链。
+fn derive_public_key_from_account(account: &AccountId) -> Option<PublicKey> {
+    let name = account.as_str();
+    // 长度不对就直接退出：NEAR 的账户名最长 64 字符，
+    // 所以 128 字符的 secp256k1 隐式账户在这个分支里实际上走不到——
+    // 保留判断是为了让规则自解释，也为了账户长度上限放宽后仍然成立。
+    if name.len() != 64 && name.len() != 128 {
+        return None;
+    }
+    if !name.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    // `from_bytes` 会按长度判定密钥类型并做合法性校验。
+    from_bytes(&hexutil::decode_hex(name).ok()?).ok()
 }
 
 /// 解析网络名；`None` 与空串都视为默认 **mainnet**（与其它链一致：默认主网）。
@@ -472,6 +585,121 @@ impl ChainClient for NearClient {
         })))
     }
 
+    /// 无私钥转账第一步：联网取 nonce 与近期区块哈希，组装交易，返回待签摘要。
+    ///
+    /// 领域说明——本链比 ETH / SOL 多出来的一个必填项：**公钥**。
+    /// NEAR 的交易体里写着 `public_key` 字段，而账户名（`alice.near`）与密钥是
+    /// 解耦的，一把账户名下可挂多把 key。没给 `public_key` 时的解析顺序见
+    /// [`Self::resolve_signer_public_key`]。
+    ///
+    /// 关于返回的两个 hex：
+    /// - `signing_payload_hex` 是 **32 字节**的 `sha256(borsh(Transaction))`，
+    ///   对它做一次 ed25519 即可（不要再哈希）；
+    /// - `unsigned_tx_hex` 是带**占位签名**的完整外壳，签完覆盖最后 64 字节再提交。
+    async fn build_transfer(
+        &self,
+        req: BuildTransferRequest,
+    ) -> Result<BuildTransferView, SdkError> {
+        // 账户名与金额都是纯本地解析，先做——让错误尽早、便宜地暴露。
+        let signer_id = parse_account(&req.from)?;
+        let receiver_id = parse_account(&req.to)?;
+        let amount = crate::units::parse_near(&req.amount)
+            .map_err(|e| SdkError::invalid_argument(format!("非法金额: {e}")))?;
+
+        let public_key = self
+            .resolve_signer_public_key(&signer_id, req.public_key.as_deref())
+            .await?;
+
+        let unsigned = crate::transactions::build_unsigned_transfer(
+            &self.client,
+            &signer_id,
+            &public_key,
+            &receiver_id,
+            amount,
+            // 不覆盖 nonce：走「查链上 nonce + 1」的正常路径。
+            None,
+        )
+        .await
+        .map_err(|e| self.fail("构造未签名转账失败", e))?;
+
+        Ok(BuildTransferView::new(
+            ChainKind::Near,
+            &self.network,
+            req.from,
+            req.to,
+            amount,
+            unsigned.unsigned_tx_hex,
+            unsigned.signing_payload_hex.clone(),
+            // 签名算法随公钥类型而变（NEAR 的 access key 绝大多数是 ed25519，
+            // 但 secp256k1 也合法，不能写死）。
+            public_key.key_type().to_string(),
+            // payload 已经是 sha256(borsh(Transaction)) 的摘要，
+            // ed25519 直接签它——这一点与 SOL（签消息体原文）截然不同。
+            "sha256",
+        )
+        .with_extra(json!({
+            // 交易体里写明的公钥，agent 必须用它对应的私钥签名。
+            "public_key": public_key.to_string(),
+            "nonce": unsigned.nonce,
+            "block_hash": unsigned.block_hash.to_string(),
+            // 交易哈希与待签摘要是同一个值，回显出来便于对账与后续查询。
+            "tx_hash": unsigned.signing_payload_hex,
+            // 明确写出「怎么把签名装回去」：覆盖外壳最后 64 字节。
+            "splice": "replace_last_64_bytes",
+            "signature_length": 64,
+            "note": "对 signing_payload_hex（32 字节）做一次 ed25519 签名，\
+                     用得到的 64 字节覆盖 unsigned_tx_hex 的末尾 64 字节后提交",
+            "next": "submit_tx",
+        })))
+    }
+
+    /// 无私钥转账第二步：广播 agent 签好的交易。
+    ///
+    /// 领域说明：走 `broadcast_tx_async`，发完即返回哈希，**不等确认**。
+    /// 广播成功 ≠ 上链成功——nonce 冲突、余额不足、签名与公钥不匹配等错误
+    /// 要等交易执行时才暴露。确认结果请用 `tx(<hash>@<sender.near>)` 查询。
+    async fn submit_tx(&self, req: SubmitRequest) -> Result<SubmitView, SdkError> {
+        // 归一化：没传 / 空串都折算成缺省的 hex。
+        let encoding = req
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("hex");
+
+        let raw = match encoding {
+            "hex" => hexutil::decode_hex(&req.signed_tx_hex)?,
+            "base64" => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(req.signed_tx_hex.trim())
+                    .map_err(|e| {
+                        SdkError::invalid_argument(format!("已签名交易不是合法 base64: {e}"))
+                    })?
+            }
+            // 显式拒绝未列出的编码，而不是「默认按 hex 解」——
+            // 后者会把 base64 串当 hex 解出一半垃圾字节，错误信息将完全误导。
+            other => {
+                return Err(SdkError::invalid_argument(format!(
+                    "NEAR 已签名交易只接受 hex 或 base64 编码，收到 {other}"
+                )));
+            }
+        };
+        if raw.is_empty() {
+            return Err(SdkError::invalid_argument("已签名交易为空"));
+        }
+
+        let tx_hash = crate::transactions::broadcast_raw(&self.client, &raw)
+            .await
+            .map_err(|e| self.fail("广播已签名交易失败", e))?;
+
+        Ok(SubmitView::new(ChainKind::Near, &self.network, tx_hash.to_string()).with_extra(json!({
+            "broadcast": true,
+            "encoding": encoding,
+            "note": "broadcast_tx_async 不等确认，请用 tx(<hash>@<sender.near>) 查询最终结果",
+        })))
+    }
+
     async fn address_from_pubkey(&self, pubkey: &str) -> Result<AddressView, SdkError> {
         // 解析成 NEAR 的 `PublicKey` 枚举（支持带类型前缀、裸 base58、十六进制三种写法）。
         let key = parse_public_key(pubkey)?;
@@ -664,6 +892,32 @@ mod tests {
         assert_eq!(hexutil::encode_hex(key.key_data()).len(), 64);
     }
 
+    /// 隐式账户（账户名 = 公钥十六进制）能本地反推公钥；具名账户不能。
+    ///
+    /// 这条测试守护的是无私钥流程的公钥解析第 2 级回落：
+    /// 隐式账户很常见（程序化创建的收款账户多是这种），能本地反推就省一次 RPC。
+    #[test]
+    fn implicit_account_derives_its_public_key() {
+        let key = parse_public_key(ED25519_B58).unwrap();
+        // 隐式账户名 = 公钥字节的十六进制（小写、无前缀）。
+        let account: AccountId = hexutil::encode_hex(key.key_data()).parse().unwrap();
+        let derived = derive_public_key_from_account(&account).expect("隐式账户应能反推公钥");
+        assert_eq!(derived, key);
+
+        // 具名账户与密钥无关，反推不了——必须查链或由调用方显式指定。
+        assert!(derive_public_key_from_account(&"alice.near".parse().unwrap()).is_none());
+    }
+
+    /// 长度够但字符不是十六进制时，不能误判成隐式账户。
+    ///
+    /// 若漏了字符集检查，`"z".repeat(64)` 会被当成 32 字节公钥去解码而报错——
+    /// 错误本身不致命，但会让「查链」这条正确路径被跳过。
+    #[test]
+    fn non_hex_64_char_account_is_not_implicit() {
+        let account: AccountId = "z".repeat(64).parse().unwrap();
+        assert!(derive_public_key_from_account(&account).is_none());
+    }
+
     /// 未知密钥类型、空串、错误长度都必须报错。
     #[test]
     fn rejects_unknown_type_and_bad_length() {
@@ -675,5 +929,48 @@ mod tests {
         // 但长度 32 既不是 64 也不是 128，因此**不会**被判为 hex，
         // 走 base58 分支解码后得到 23 字节左右 → 长度不匹配 → 报错。
         assert!(parse_public_key(&"ab".repeat(16)).is_err());
+    }
+
+    /// 回归测试：`fail` 必须保留 anyhow 的**整条错误链**。
+    ///
+    /// 领域说明：NEAR 的 `near-jsonrpc-client` 会把错误层层包装
+    ///（`JsonRpcError -> RpcError -> 序列化/传输错误`），
+    /// 而 `anyhow::Error` 的普通 `Display` **只打印最外层**。
+    /// 旧实现 `format!("{context}: {err}")` 因此把根因丢掉，
+    /// 表现为「只说查询账户失败，不说是不是连不上节点」——
+    /// 而 `classify` 又靠关键词分类，丢链会让它误判兜底的 `RpcError`。
+    ///
+    /// 语法说明：`Err::<(), _>(..)` 用 **turbofish** 指定 Ok 侧类型为 `()`，
+    /// 以便在 `Result` 上调用 `anyhow::Context::context`（该 trait 也是为
+    /// `Result` 实现的），最后 `unwrap_err()` 取出包装后的 `anyhow::Error`。
+    #[test]
+    fn fail_keeps_the_root_cause_of_a_nested_anyhow_error() {
+        use allchain_core::ErrorCode;
+        use anyhow::Context;
+
+        let root = anyhow::anyhow!("connection refused (os error 61)");
+        let err = Err::<(), _>(root).context("查询账户失败").unwrap_err();
+
+        let sdk = fail("查询地址失败", err);
+
+        assert!(sdk.message.contains("查询地址失败"), "{}", sdk.message);
+        assert!(sdk.message.contains("查询账户失败"), "{}", sdk.message);
+        // 最关键的一条：根因必须透出。
+        assert!(sdk.message.contains("connection refused"), "{sdk:?}");
+        // 根因关键词必须真的驱动分类：这里应是网络错误，而不是兜底的 RpcError。
+        assert_eq!(sdk.code, ErrorCode::NetworkError, "message = {}", sdk.message);
+    }
+
+    /// 上一条测试的**反证**：只看外层中文上下文时，`classify` 落到的码
+    /// 必然不是 `NetworkError`。
+    ///
+    /// 没有这条，「根因参与了分类」就可能只是个恒真断言——
+    /// 若 `classify` 对所有中文文本都返回 `NetworkError`，上一条也会绿。
+    #[test]
+    fn classifying_only_the_outer_context_would_misjudge_the_code() {
+        use allchain_core::ErrorCode;
+
+        let only_outer = allchain_core::error::classify("查询地址失败: 查询账户失败");
+        assert_ne!(only_outer.code, ErrorCode::NetworkError);
     }
 }

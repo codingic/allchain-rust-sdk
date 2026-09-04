@@ -24,3 +24,4 @@ sui-sdk-types = { version = "=0.0.7", features = ["serde"] }
 ed25519-dalek = "2.2"
 bcs = "0.1.6"
 base64 = "0.22"
+hex = { workspace = true }

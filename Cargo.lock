@@ -27,6 +27,7 @@ dependencies = [
  "eth-sdk",
  "fil-sdk",
  "near-sdk",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sol-sdk",

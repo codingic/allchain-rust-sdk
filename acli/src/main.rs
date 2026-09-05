@@ -171,6 +171,14 @@ enum Command {
         #[arg(long)]
         pubkey: String,
     },
+    /// 查询某条链的接收地址（来自 sign 离线签名服务，需 sign 在跑）
+    // `name = "getaddress"` 显式指定子命令名；`alias = "address"` 照顾短写法。
+    // 与 `address-from-pubkey` 区分：本命令**不传公钥**，地址直接由 sign 服务提供。
+    #[command(name = "getaddress", alias = "address")]
+    GetAddress {
+        #[command(flatten)]
+        chain: ChainArgs,
+    },
     /// 转账（本地签名；--dry-run 只签名不广播）
     Transfer {
         #[command(flatten)]
@@ -293,6 +301,8 @@ async fn main() -> anyhow::Result<()> {
         Command::AddressFromPubkey { chain, pubkey } => {
             run(chain, Action::AddressFromPubkey { pubkey }).await
         }
+
+        Command::GetAddress { chain } => run(chain, Action::GetAddress).await,
 
         Command::Transfer {
             chain,

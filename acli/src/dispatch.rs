@@ -70,6 +70,12 @@ pub enum Action {
         /// 公钥；格式随链而异（十六进制 / base58 / ed25519: 前缀 / RSA 模数 base64url ...）。
         pubkey: String,
     },
+    /// 查询某条链的接收地址；代理 sign 离线签名服务返回（sign 持有 keystore 并派生地址）。
+    ///
+    /// 与 `AddressFromPubkey`（由公钥本地推导）不同：本变体**不接公钥**，地址直接来自
+    /// sign 服务的 `GET /v1/chains`。这样 SDK 不必自己持有或推导地址，
+    /// 与 sign「密钥不出离线服务」的边界一致。
+    GetAddress,
     /// 转账；私钥缺省时按链从环境变量读取。
     Transfer {
         /// 收款地址 / 账户；NEAR 传账户名。
@@ -258,6 +264,9 @@ pub async fn run_action(
             .await
             .and_then(to_value)
             .map(|v| with_rpc(v, &rpc_url)),
+        // 取某链地址：不经过链适配器，而是代理 sign 服务。复用 `sign_address`（见下），
+        // 它已返回 `Value`，故不再走 `to_value` / `with_rpc` 流水线。
+        Action::GetAddress => sign_address(chain).await,
         Action::Transfer {
             to,
             amount,
@@ -465,6 +474,87 @@ fn resolve_private_key(chain: ChainKind, explicit: Option<&str>) -> Result<Strin
             })
         }
     }
+}
+
+/// 代理 sign 离线签名服务，查询某条链的接收地址。
+///
+/// 地址由 sign 服务持有：sign 的 `GET /v1/chains` 把每条链的 `address` 一起返回，
+/// SDK 自身不保存、也不推导地址——与 sign「私钥 / keystore 留在离线服务内」的边界一致。
+///
+/// 语法说明：
+/// - `std::env::var("SIGN_URL")` 读环境变量；`.unwrap_or_else(..)` 在缺失时回退到默认 base。
+///   用 `unwrap_or_else`（惰性闭包）而非 `unwrap_or(..)`：默认串的分配只在真的缺变量时才发生。
+/// - `reqwest::Client::new()` 构造无状态 HTTP 客户端；`.get(&url).send().await`
+///   发起 GET 并真正发出请求；`.json::<Value>().await` 把响应体反序列化为 `serde_json::Value`。
+///   整条调用异步，故本函数标 `async`，由 `run_action` 里的 `.await` 推进。
+async fn sign_address(chain: ChainKind) -> Result<Value, SdkError> {
+    // 默认回环地址：sign 服务默认监听 `127.0.0.1:7878`；可用 `SIGN_URL` 覆盖，
+    // 便于把 sign 与 SDK 部署在不同容器 / 主机时仍能对接。
+    let base = std::env::var("SIGN_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:7878".to_string());
+    let url = format!("{base}/v1/chains");
+
+    // 网络层故障（sign 没起、端口不对、DNS 失败）统一归 `NetworkError`（HTTP 502）：
+    // 「网关打不通上游」不是调用方的锅，且可按 `retryable` 重试。
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| SdkError::new(ErrorCode::NetworkError, format!("sign 服务不可达 {url}: {e}")))?;
+
+    // sign 用统一信封返回（`ok` + `data` / `error`）。先把整份响应解析成 `Value`：
+    // 解析失败（如 sign 返回了 HTML 错误页）归 `Internal`，因为「上游结构变了」。
+    let body: Value = resp.json().await.map_err(|e| {
+        SdkError::new(ErrorCode::Internal, format!("sign 返回的不是合法 JSON（{url}）: {e}"))
+    })?;
+
+    // 信封 `ok` 为 false：sign 自己报了错。优先取 `error.message` 透传给调用方，
+    // 让「密钥缺失 / 链不支持」这类语义错误能原样呈现，而非被压成一句泛泛的 NetworkError。
+    let ok = body.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("sign /v1/chains 返回 ok=false 但未携带 error.message");
+        return Err(SdkError::new(ErrorCode::NetworkError, format!("sign 服务报错: {msg}")));
+    }
+
+    // 在 `data.chains` 数组里按 `chain` 字段找到本链条目。
+    // 取不到数组即视为 sign 响应结构不符预期 → `Internal`。
+    let chains = body
+        .get("data")
+        .and_then(|d| d.get("chains"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            SdkError::new(ErrorCode::Internal, "sign /v1/chains 缺少 data.chains 数组".to_string())
+        })?;
+
+    let entry = chains
+        .iter()
+        .find(|c| c.get("chain").and_then(Value::as_str) == Some(chain.as_str()))
+        .ok_or_else(|| {
+            SdkError::new(
+                ErrorCode::NotFound,
+                format!("sign /v1/chains 未返回链 {chain} 的地址（请确认 sign 支持该链）"),
+            )
+        })?;
+
+    // 取出该链的 `address` 字段；缺失则归 `Internal`（sign 契约不全）。
+    let address = entry
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SdkError::new(
+                ErrorCode::Internal,
+                format!("sign /v1/chains 中 {chain} 缺少 address 字段"),
+            )
+        })?
+        .to_string();
+
+    // 返回与 `AddressFromPubkey` 同源的结构：`{ chain, address }`，
+    // 方便 agent 在「派生」和「取现成地址」两条路径上共用同一套解析。
+    Ok(serde_json::json!({ "chain": chain.as_str(), "address": address }))
 }
 
 /// 能力清单，供 `/v1/chains` 与 MCP 的 `chain_catalog` 工具使用；能力按链真实声明。

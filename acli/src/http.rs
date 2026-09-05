@@ -155,6 +155,7 @@ pub async fn serve(host: String, port: u16) -> anyhow::Result<()> {
         .route("/v1/block/by-height", get(block_by_height_handler))
         .route("/v1/tx", get(tx_handler))
         .route("/v1/address-from-pubkey", get(address_from_pubkey_handler))
+        .route("/v1/address", get(address_handler))
         // 写操作只挂在 POST 上。
         .route("/v1/transfer", post(transfer_handler))
         // 两段式的两个端点。构造走 GET：它只读取链上状态并在本地组装，
@@ -175,6 +176,7 @@ pub async fn serve(host: String, port: u16) -> anyhow::Result<()> {
     eprintln!("  GET /v1/block/by-height?chain=eth&height=19000000");
     eprintln!("  GET /v1/tx?chain=near&hash=<tx_hash>@<sender.near>");
     eprintln!("  GET /v1/address-from-pubkey?chain=eth&pubkey=<64B 十六进制公钥>");
+    eprintln!("  GET /v1/address?chain=eth   # 取该链接收地址（来自 sign 服务）");
     eprintln!(
         "  POST /v1/transfer   body: {{chain,to,amount,private_key?,dry_run?,from?,network?,rpc_url?}}"
     );
@@ -258,6 +260,14 @@ async fn address_from_pubkey_handler(Query(params): Query<AddressFromPubkeyParam
         },
     )
     .await
+}
+
+/// `GET /v1/address`：取某链地址（代理 sign 离线签名服务，需 sign 在跑）。
+///
+/// 与 `address_from_pubkey` 的区别：这里**不传公钥**，地址由 sign 服务直接给出，
+/// 因此 handler 只吃 `BaseParams`（chain / network / rpc_url），不定义额外字段。
+async fn address_handler(Query(params): Query<BaseParams>) -> Response {
+    run(params, Action::GetAddress).await
 }
 
 /// `POST /v1/transfer`

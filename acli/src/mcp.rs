@@ -227,6 +227,8 @@ async fn execute(name: &str, arguments: &Value) -> Result<allchain_core::Envelop
                 pubkey: require_str(arguments, "pubkey")?.to_string(),
             }
         }
+        // 取某链地址：不接公钥，地址来自 sign 离线签名服务（需 sign 在跑）。
+        "chain_get_address" => Action::GetAddress,
         "chain_transfer" => Action::Transfer {
             to: require_str(arguments, "to")?.to_string(),
             amount: require_str(arguments, "amount")?.to_string(),
@@ -459,6 +461,22 @@ fn tools() -> Vec<Value> {
                     "rpc_url": rpc_prop()
                 },
                 "required": ["chain", "pubkey"]
+            }
+        }),
+        json!({
+            "name": "chain_get_address",
+            "description": "查询指定链的接收地址。地址由 sign 离线签名服务提供（私钥/keystore 留在离线服务内），\
+                            不接公钥、不在 SDK 侧推导。需 sign 服务可达（默认 http://127.0.0.1:7878，可用 SIGN_URL 覆盖）。\
+                            返回 { chain, address }。与 chain_address_from_pubkey（本地由公钥推导）互为补充：\
+                            当你手上有公钥时用后者，没有公钥、想直接拿 sign 管理的地址时用本工具。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chain": chain_prop(),
+                    "network": network_prop(),
+                    "rpc_url": rpc_prop()
+                },
+                "required": ["chain"]
             }
         }),
         json!({
